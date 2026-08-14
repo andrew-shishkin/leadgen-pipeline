@@ -1,0 +1,406 @@
+<title>Как работает конвейер поиска ЛПР</title>
+<style>
+  :root {
+    --paper:#f2f5f3; --card:#ffffff; --ink:#15191c; --ink-2:#414b50; --muted:#6f7c82;
+    --line:#d9e2dd; --line-2:#e9efeb;
+    --bot:#1e6b59; --bot-bg:#e2efe9; --ai:#a55f1c; --ai-bg:#f8ebdd;
+    --pay:#7a4b8f; --pay-bg:#efe6f3; --stop:#93383a; --stop-bg:#f6e5e4;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, "Helvetica Neue", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --paper:#0f1214; --card:#181d20; --ink:#e8edea; --ink-2:#b6c2be;
+      --muted:#828f94; --line:#293034; --line-2:#202628;
+      --bot:#5fc2a6; --bot-bg:#15302a; --ai:#dc9a55; --ai-bg:#332415;
+      --pay:#c297d6; --pay-bg:#2a1f30; --stop:#d98484; --stop-bg:#331e1e; }
+  }
+  :root[data-theme="dark"] {
+    --paper:#0f1214; --card:#181d20; --ink:#e8edea; --ink-2:#b6c2be; --muted:#828f94;
+    --line:#293034; --line-2:#202628;
+    --bot:#5fc2a6; --bot-bg:#15302a; --ai:#dc9a55; --ai-bg:#332415;
+    --pay:#c297d6; --pay-bg:#2a1f30; --stop:#d98484; --stop-bg:#331e1e;
+  }
+  :root[data-theme="light"] {
+    --paper:#f2f5f3; --card:#ffffff; --ink:#15191c; --ink-2:#414b50; --muted:#6f7c82;
+    --line:#d9e2dd; --line-2:#e9efeb;
+    --bot:#1e6b59; --bot-bg:#e2efe9; --ai:#a55f1c; --ai-bg:#f8ebdd;
+    --pay:#7a4b8f; --pay-bg:#efe6f3; --stop:#93383a; --stop-bg:#f6e5e4;
+  }
+
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--paper); color:var(--ink); font-family:var(--sans);
+         font-size:17px; line-height:1.62; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:880px; margin:0 auto; padding:56px 24px 100px; }
+  p { margin:0 0 14px; max-width:64ch; }
+
+  .eyebrow { font-family:var(--mono); font-size:11.5px; letter-spacing:.16em; text-transform:uppercase;
+             color:var(--muted); margin:0 0 14px; }
+  h1 { font-size:clamp(32px,5.5vw,46px); line-height:1.08; letter-spacing:-.022em; font-weight:700;
+       margin:0 0 18px; text-wrap:balance; }
+  .lede { font-size:19px; color:var(--ink-2); max-width:60ch; margin:0; }
+  h2 { font-size:12.5px; font-family:var(--mono); letter-spacing:.13em; text-transform:uppercase;
+       color:var(--muted); font-weight:600; margin:0 0 22px; padding-bottom:10px;
+       border-bottom:1px solid var(--line); }
+  section { margin-top:66px; }
+
+  /* ── легенда: ключ ко всей схеме ── */
+  .legend { display:grid; gap:10px; grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); }
+  .lg { background:var(--card); border:1px solid var(--line); border-radius:11px; padding:15px 16px; }
+  .lg .who { font-family:var(--mono); font-size:11.5px; font-weight:700; letter-spacing:.09em;
+             text-transform:uppercase; display:inline-block; padding:4px 10px; border-radius:999px; }
+  .lg p { font-size:14px; color:var(--ink-2); margin:11px 0 0; }
+  .w-bot { background:var(--bot-bg); color:var(--bot); }
+  .w-ai  { background:var(--ai-bg);  color:var(--ai); }
+  .w-pay { background:var(--pay-bg); color:var(--pay); }
+
+  /* ── конвейер ── */
+  .flow { position:relative; padding-left:46px; }
+  .flow::before { content:""; position:absolute; left:15px; top:14px; bottom:22px;
+                  width:2px; background:var(--line); }
+  /* Каждый шаг занимает экран целиком — чтобы на записи урока в кадре был
+     ровно один шаг и ничего лишнего. */
+  .step { position:relative; margin-bottom:0; min-height:82vh;
+          display:flex; flex-direction:column; justify-content:center;
+          padding:5vh 0; }
+  @media (max-height:620px), (max-width:640px) {
+    .step { min-height:0; padding:26px 0; }
+  }
+  .step::before { content:attr(data-n); position:absolute; left:-46px; top:50%;
+    transform:translateY(-50%);
+    width:38px; height:38px; border-radius:50%; background:var(--card);
+    border:2px solid var(--line); color:var(--muted);
+    font-family:var(--mono); font-size:15px; font-weight:700;
+    display:flex; align-items:center; justify-content:center; }
+  .step.bot::before { border-color:var(--bot); color:var(--bot); }
+  .step.ai::before  { border-color:var(--ai);  color:var(--ai); }
+  .step.pay::before { border-color:var(--pay); color:var(--pay); }
+
+  .step h3 { font-size:21px; letter-spacing:-.012em; margin:2px 0 8px; font-weight:650;
+             text-wrap:balance; line-height:1.28; }
+  .step > p { font-size:16px; color:var(--ink-2); margin:0 0 12px; }
+  .badge { font-family:var(--mono); font-size:11px; font-weight:700; letter-spacing:.08em;
+           text-transform:uppercase; padding:4px 10px; border-radius:999px; margin-right:7px;
+           display:inline-block; margin-bottom:10px; }
+
+  /* ── развилки ── */
+  .forks { display:grid; gap:8px; margin-top:6px; }
+  .fork { display:grid; grid-template-columns:auto 1fr; gap:13px; align-items:baseline;
+          background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:12px 15px; font-size:15.5px; }
+  .fork .cond { font-family:var(--mono); font-size:11.5px; font-weight:700; letter-spacing:.06em;
+                text-transform:uppercase; white-space:nowrap; padding-top:3px; }
+  .fork.go   { border-left:4px solid var(--bot); }  .fork.go   .cond { color:var(--bot); }
+  .fork.warn { border-left:4px solid var(--ai); }   .fork.warn .cond { color:var(--ai); }
+  .fork.stop { border-left:4px solid var(--stop); } .fork.stop .cond { color:var(--stop); }
+  .fork b { font-weight:650; }
+  .fork small { display:block; color:var(--muted); font-size:13.5px; margin-top:3px; line-height:1.45; }
+
+  .terminal { background:var(--card); border:2px solid var(--line); border-radius:12px;
+              padding:20px 22px; margin-bottom:30px; }
+  .terminal .kicker { font-family:var(--mono); font-size:11.5px; letter-spacing:.13em;
+                      text-transform:uppercase; color:var(--muted); margin:0 0 8px; }
+  .terminal h3 { font-size:20px; margin:0 0 6px; font-weight:650; }
+  .terminal p { font-size:15.5px; color:var(--ink-2); margin:0; }
+
+  .out { display:grid; gap:11px; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); }
+  .oc { background:var(--card); border:1px solid var(--line); border-radius:11px; padding:17px 18px;
+        border-top:4px solid var(--bot); }
+  .oc h4 { font-size:16.5px; margin:0 0 6px; font-weight:650; }
+  .oc p { font-size:14px; color:var(--ink-2); margin:0; }
+
+  .scroll { overflow-x:auto; border:1px solid var(--line); border-radius:11px; background:var(--card); }
+  table { width:100%; border-collapse:collapse; font-size:15px; }
+  th { text-align:left; font-family:var(--mono); font-size:11px; letter-spacing:.09em;
+       text-transform:uppercase; color:var(--muted); font-weight:600; padding:13px 15px;
+       border-bottom:1px solid var(--line); white-space:nowrap; }
+  td { padding:12px 15px; border-bottom:1px solid var(--line-2); vertical-align:top; }
+  tr:last-child td { border-bottom:0; }
+  td.n { font-family:var(--mono); font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .hi { color:var(--bot); font-weight:650; }
+
+  .note { border-left:4px solid var(--ai); background:var(--card); border-radius:0 11px 11px 0;
+          padding:17px 19px; margin:22px 0; }
+  .note .lbl { font-family:var(--mono); font-size:11px; letter-spacing:.11em; text-transform:uppercase;
+               color:var(--muted); display:block; margin-bottom:8px; }
+  .note p:last-child { margin-bottom:0; }
+  .note p { font-size:15.5px; }
+
+  ul { margin:0 0 14px; padding-left:22px; max-width:64ch; } li { margin-bottom:8px; }
+  code { font-family:var(--mono); font-size:.88em; background:var(--line-2); padding:2px 6px; border-radius:5px; }
+  footer { margin-top:76px; padding-top:22px; border-top:1px solid var(--line);
+           font-family:var(--mono); font-size:12px; color:var(--muted); }
+</style>
+
+<div class="wrap">
+
+  <p class="eyebrow">Практикум по B2B-лидогенерации</p>
+  <h1>Как работает конвейер поиска ЛПР</h1>
+  <p class="lede">На входе — список компаний. На выходе — люди с именами, должностями
+    и рабочими почтами. Ниже вся дорога от одного к другому.</p>
+
+  <section>
+    <h2>Как читать схему</h2>
+    <p>Главное, что нужно понять сразу: конвейер собран так, чтобы <b>платить как можно
+      позже</b>. Сначала работает бесплатный скрипт и выбрасывает всё лишнее — и только
+      то, что осталось, попадает к нейросети и в платные сервисы.</p>
+    <div class="legend">
+      <div class="lg"><span class="who w-bot">Скрипт</span>
+        <p>Обычная программа. Открывает сайты, вытаскивает почты и телефоны, убирает
+          повторы. Бесплатно и мгновенно.</p></div>
+      <div class="lg"><span class="who w-ai">Нейросеть</span>
+        <p>Там, где нужно понять смысл: подходит ли компания, кто этот человек.
+          Стоит денег — доли цента за компанию.</p></div>
+      <div class="lg"><span class="who w-pay">Платный сервис</span>
+        <p>Поиск и проверка почт: Wiza, Prospeo, ZeroBounce. Здесь цена уже
+          заметная, поэтому обращаемся в последнюю очередь.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Конвейер</h2>
+
+    <div class="terminal">
+      <p class="kicker">Что кладём на вход</p>
+      <h3>Список компаний</h3>
+      <p>Выгрузка из Контур Компас, Datanewton, Sales Navigator — откуда угодно.
+        Достаточно названия и сайта. Будут ИНН, телефон и ФИО директора — тем лучше,
+        всё пригодится.</p>
+    </div>
+
+    <div class="flow">
+
+      <div class="step bot" data-n="1">
+        <h3>Загружаем список</h3>
+        <span class="badge w-bot">Скрипт</span>
+        <p>Программа сама распознаёт колонки — у всех выгрузки называются по-разному.
+          Одинаковые компании склеиваются, чтобы не платить за них дважды.</p>
+        <div class="forks">
+          <div class="fork go"><span class="cond">Сразу плюс</span>
+            <span><b>Если в файле был директор — он уже попал в список ЛПР.</b>
+            <small>Готовый контакт, за который не заплачено ничего.</small></span></div>
+        </div>
+      </div>
+
+      <div class="step bot" data-n="2">
+        <h3>Проверяем, есть ли сайт</h3>
+        <span class="badge w-bot">Скрипт</span>
+        <p>Сайт — точка входа ко всему остальному. Без него компания бесполезна.</p>
+        <div class="forks">
+          <div class="fork go"><span class="cond">Есть</span><span>Идём дальше.</span></div>
+          <div class="fork warn"><span class="cond">Нет</span>
+            <span><b>Ищем сайт в поиске по названию и ИНН.</b>
+            <small>Здесь подключается нейросеть — она понимает, что «ООО Ромашка» и
+              найденный romashka-zavod.ru это одно и то же, а каталог с упоминанием
+              компании — нет.</small></span></div>
+          <div class="fork stop"><span class="cond">Не нашли</span>
+            <span>Откладываем. Работать не с чем.</span></div>
+        </div>
+      </div>
+
+      <div class="step bot" data-n="3">
+        <h3>Открываем сайт</h3>
+        <span class="badge w-bot">Скрипт</span>
+        <p>Пробуем несколько способов подряд, пока сайт не поддастся: обычный заход,
+          заход в обход просроченного сертификата, запуск настоящего браузера. Платный
+          парсер — только для единиц, что не открылись ничем.</p>
+        <div class="forks">
+          <div class="fork go"><span class="cond">Открылся</span><span>Идём дальше.</span></div>
+          <div class="fork stop"><span class="cond">Не открылся</span>
+            <span><b>Скорее всего компании больше нет.</b>
+            <small>На проверке из ста компаний такими оказались примерно десять: домены
+              не существуют или хостинг не оплачен.</small></span></div>
+        </div>
+      </div>
+
+      <div class="step bot" data-n="4">
+        <h3>Забираем всё, что лежит на виду</h3>
+        <span class="badge w-bot">Скрипт</span>
+        <p>Почты, телефоны, текст страницы. Нейросеть для этого не нужна: программа
+          находит почты точнее и не выдумывает несуществующих. Всё собранное
+          складывается в «общий список почт компании» — он пригодится в конце.</p>
+      </div>
+
+      <div class="step ai" data-n="5">
+        <h3>Подходит ли компания?</h3>
+        <span class="badge w-ai">Нейросеть</span>
+        <p>Первый шаг, который стоит денег. Нейросеть читает сайт и отвечает на ваши
+          критерии — вы задаёте их сами обычным текстом. И обязательно приводит
+          цитаты с сайта, на которых построила вывод: по ним видно, не придумала ли она.</p>
+        <div class="forks">
+          <div class="fork go"><span class="cond">Подходит</span><span>Идём дальше — только за такими компаниями.</span></div>
+          <div class="fork stop"><span class="cond">Не подходит</span><span>Откладываем. Дальше на неё не тратится ни копейки.</span></div>
+          <div class="fork warn"><span class="cond">Непонятно</span>
+            <span><b>В отдельный список на ручную проверку.</b>
+            <small>Важно: спорные не выбрасываются молча. Лучше просмотреть глазами
+              двадцать строк, чем потерять завод.</small></span></div>
+        </div>
+      </div>
+
+      <div class="step ai" data-n="6">
+        <h3>Читаем остальные страницы</h3>
+        <span class="badge w-bot">Скрипт</span><span class="badge w-ai">Нейросеть</span>
+        <p>«Контакты», «О компании», «Команда» — <b>только у подходящих компаний</b>.
+          Скрипт забирает страницы, нейросеть достаёт из них имена и должности.</p>
+      </div>
+
+      <div class="step ai" data-n="7">
+        <h3>Ищем ЛПР в поиске</h3>
+        <span class="badge w-ai">Нейросеть</span>
+        <p>Нужных людей часто нет на сайте, но они попадают в статьи, интервью, отзывы
+          и отраслевые публикации. Это <b>необязательный шаг</b> — включается по желанию,
+          и перед полным запуском вы увидите, сколько он стоит и сколько людей находит.</p>
+        <div class="forks">
+          <div class="fork warn"><span class="cond">Проверка</span>
+            <span><b>Каждого найденного перепроверяем по первоисточнику.</b>
+            <small>В превью поиска человек может быть упомянут рядом с компанией, но
+              работать в другой. Нейросеть открывает страницу и убеждается.</small></span></div>
+          <div class="fork stop"><span class="cond">Не подтвердилось</span><span>Выбрасываем.</span></div>
+          <div class="fork stop"><span class="cond">Устарело</span>
+            <span>Публикация старше выбранного года — выбрасываем. Человек уже сменил работу.</span></div>
+        </div>
+      </div>
+
+      <div class="step pay" data-n="8">
+        <h3>Ищем почту каждого ЛПР</h3>
+        <span class="badge w-bot">Скрипт</span><span class="badge w-ai">Нейросеть</span><span class="badge w-pay">Платный сервис</span>
+        <p>Три попытки строго по очереди, от бесплатной к дорогой. Как только почта
+          нашлась — следующие попытки не запускаются.</p>
+        <div class="forks">
+          <div class="fork go"><span class="cond">Попытка 1</span>
+            <span><b>Ищем среди уже собранных почт.</b>
+            <small>Нужен Иванов Пётр Сергеевич — а в списке лежит <code>p.s.ivanov@</code>.
+              Бесплатно.</small></span></div>
+          <div class="fork warn"><span class="cond">Попытка 2</span>
+            <span><b>Спрашиваем нейросеть, не проглядели ли мы.</b>
+            <small>Она узнаёт <code>ivanovceo@</code> или <code>gendir@</code> — варианты,
+              которые заранее в программу не заложить.</small></span></div>
+          <div class="fork warn"><span class="cond">Попытка 3</span>
+            <span><b>Покупаем: Wiza → Prospeo → FullEnrich → Findymail.</b>
+            <small>По очереди, пока кто-нибудь не найдёт. Нашёл первый — за остальных
+              не платим.</small></span></div>
+        </div>
+      </div>
+
+      <div class="step pay" data-n="9">
+        <h3>Проверяем, что почта живая</h3>
+        <span class="badge w-pay">Платный сервис</span>
+        <p>Проверяются только купленные почты — найденные на сайте и так рабочие.
+          Выбрасываем лишь явный брак: в России половина корпоративных ящиков не
+          проверяется до конца, и отбрасывать их значило бы терять половину базы.</p>
+      </div>
+
+      <div class="step ai" data-n="10">
+        <h3>Готовим переменные для писем</h3>
+        <span class="badge w-ai">Нейросеть</span>
+        <p>Имя и отчество в правильном падеже, чтобы письмо начиналось с «Здравствуйте,
+          Пётр Сергеевич», а не с «Здравствуйте, Иванов Пётр Сергеевич».</p>
+      </div>
+
+      <div class="step bot" data-n="11">
+        <h3>Развилка в самом конце</h3>
+        <span class="badge w-bot">Скрипт</span>
+        <p>По части компаний найти именную почту не удастся — это нормально.</p>
+        <div class="forks">
+          <div class="fork go"><span class="cond">Почта есть</span>
+            <span>Человек уходит в таблицу с именными контактами.</span></div>
+          <div class="fork warn"><span class="cond">Почты нет</span>
+            <span><b>Компания уходит в generic-таблицу — пишем на общую почту.</b>
+            <small>Из собранных почт выбирается самая подходящая: <code>info@</code>,
+              <code>office@</code>, но никогда <code>zakaz@</code> или
+              <code>tender@</code>. И ФИО нужного человека всё равно сохраняется —
+              его можно вставить в письмо: «мне подсказали, что у вас главный
+              инженер — Пётр Сергеевич».</small></span></div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <section>
+    <h2>Чем искать людей: важный выбор</h2>
+    <p>На седьмом шаге конвейер ищет ЛПР в интернете. Здесь есть развилка, и от неё
+      напрямую зависит, сколько контактов вы получите.</p>
+    <div class="forks" style="margin-bottom:18px">
+      <div class="fork warn"><span class="cond">Вариант 1</span>
+        <span><b>Встроенный поиск — работает сразу, ничего настраивать не нужно.</b>
+        <small>Поиск уже входит в доступ к нейросети: отдельный аккаунт и ключ не
+          требуются, оплата идёт туда же. Минус в том, что он опирается на западные
+          поисковые индексы, а они российский интернет знают хуже.</small></span></div>
+      <div class="fork go"><span class="cond">Вариант 2</span>
+        <span><b>Яндекс — находит заметно больше, но нужно 15 минут на подключение.</b>
+        <small>Регистрация в Яндекс Облаке и получение ключа. Взамен вы получаете
+          выдачу, которая реально знает российский рынок.</small></span></div>
+    </div>
+    <div class="note">
+      <span class="lbl">Почему это важнее, чем кажется</span>
+      <p>Главного инженера завода в Череповце не найти в западном индексе. Он
+        упоминается в заметке районной газеты, в программе отраслевой конференции,
+        в отзыве на строительном портале, в протоколе технического совета. Всё это
+        Яндекс индексирует, а Google по большей части нет.</p>
+      <p>Разница проявляется ровно на тех компаниях, ради которых всё и затевалось:
+        региональные производства без сильного присутствия в сети. По крупным
+        и известным сработает любой поиск — они и так у всех есть.</p>
+      <p><b>Рекомендация:</b> первый запуск сделайте на встроенном поиске, чтобы
+        увидеть весь конвейер в работе. Потом посмотрите в отчёте, сколько ЛПР
+        нашлось, — и решайте, стоит ли пятнадцать минут настройки того, чтобы
+        эта цифра выросла.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Что получается на выходе</h2>
+    <div class="out">
+      <div class="oc"><h4>Компании</h4>
+        <p>Все, с отметкой кто подошёл под критерии, кто нет и почему — с цитатами
+          с сайта.</p></div>
+      <div class="oc"><h4>ЛПР с именными почтами</h4>
+        <p>Имя, должность, проверенная почта и все данные компании — готово к загрузке
+          в рассылку или CRM.</p></div>
+      <div class="oc"><h4>Generic-таблица</h4>
+        <p>Компании, где пишем на общую почту, но знаем имя нужного человека.</p></div>
+    </div>
+    <p style="margin-top:18px">Плюс отчёт после каждого запуска: сколько сайтов открылось,
+      сколько компаний оказались мёртвыми, сколько прошли отбор и сколько всё это стоило.</p>
+  </section>
+
+  <section>
+    <h2>Сколько это стоит</h2>
+    <p>Для списка в 5 000 компаний. Стоимость работы нейросети — то, за что вы платите
+      по ключу, отдельно от платных сервисов поиска почт.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Этап</th><th>Кто работает</th><th>За 5 000 компаний</th></tr></thead>
+        <tbody>
+          <tr><td>Загрузка списка, открытие сайтов, сбор почт и телефонов</td><td>скрипт</td><td class="n hi">бесплатно</td></tr>
+          <tr><td>Квалификация по критериям</td><td>нейросеть</td><td class="n">≈ $22</td></tr>
+          <tr><td>Поиск людей на страницах и в поиске</td><td>нейросеть</td><td class="n">≈ $25</td></tr>
+          <tr><td>Подбор почт, склонение имён</td><td>нейросеть</td><td class="n">≈ $3</td></tr>
+          <tr><td>Поиск и проверка почт</td><td>платные сервисы</td><td class="n">по их тарифам</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note">
+      <span class="lbl">Почему так дёшево</span>
+      <p>Со страницы сайта убирается вся техническая разметка — остаётся только текст.
+        Объём падает в двадцать четыре раза, и нейросеть читает суть вместо мусора.
+        Дальше все вопросы к ней задаются <b>одним запросом на компанию</b>, а не пятью.
+        И весь список отправляется пакетом — это ещё вдвое дешевле.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Что подготовить перед запуском</h2>
+    <ul>
+      <li><b>Список компаний</b> — файлом. Минимум название и сайт.</li>
+      <li><b>Один-два чётких критерия отбора.</b> Не «серьёзные компании», а проверяемое:
+        «есть собственное производство» и «станков больше пятидесяти». Чем конкретнее
+        критерий, тем меньше спорных строк придётся смотреть руками.</li>
+      <li><b>Список должностей</b>, которые вам нужны. Нейросеть понимает их по смыслу:
+        напишете «главный инженер» — «технический директор» тоже попадёт.</li>
+      <li><b>С какого года</b> информация о человеке считается свежей. Обычно 2022.</li>
+      <li><b>Ключ доступа к нейросети</b> и ключи сервисов поиска почт, если они у вас есть.</li>
+    </ul>
+  </section>
+
+  <footer>Схема конвейера · практикум по B2B-лидогенерации</footer>
+</div>
