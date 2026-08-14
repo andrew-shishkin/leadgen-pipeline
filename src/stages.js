@@ -67,7 +67,10 @@ export function importCsv(db, file, { columns } = {}) {
       ceo_name      = COALESCE(NULLIF(excluded.ceo_name,''), companies.ceo_name),
       emails_import = excluded.emails_import`);
 
-  const stat = { total: rows.length, imported: 0, no_site: 0, duplicates: 0 };
+  // Отдельно считаем НОВЫЕ и УЖЕ ИЗВЕСТНЫЕ: при регулярной подгрузке по триггерам
+  // именно это главная цифра — сколько компаний реально пойдёт в обработку.
+  const known = new Set(db.prepare(`SELECT domain FROM companies`).all().map((r) => r.domain));
+  const stat = { total: rows.length, imported: 0, already: 0, no_site: 0, duplicates: 0 };
   const seen = new Set();
   for (const r of rows) {
     const site = normalizeUrl(r[map.site] ?? '');
@@ -78,7 +81,7 @@ export function importCsv(db, file, { columns } = {}) {
     ins.run(domain, r[map.inn] ?? '', r[map.name] ?? '', site,
       r[map.ceo_name] ?? '', r[map.ceo_title] ?? '',
       j(splitList(r[map.phones])), j(splitList(r[map.emails])));
-    stat.imported++;
+    if (known.has(domain)) stat.already++; else stat.imported++;
   }
 
   // ФИО директора из импорта — сразу в таблицу людей, это готовый контакт

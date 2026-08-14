@@ -56,9 +56,10 @@ switch (cmd) {
     const s = importCsv(db, file);
     console.log(`\nИмпорт из ${file}`);
     console.log(`  строк в файле:      ${s.total}`);
-    console.log(`  импортировано:      ${s.imported}`);
+    console.log(`  новых компаний:     ${s.imported}   ← только они пойдут в обработку`);
+    console.log(`  уже были в базе:    ${s.already}   ← повторно не оплачиваются`);
     console.log(`  без сайта:          ${s.no_site}`);
-    console.log(`  дублей по домену:   ${s.duplicates}`);
+    console.log(`  дублей внутри файла:${s.duplicates}`);
     console.log(`  ЛПР из импорта:     ${s.people_from_import}`);
     console.log(`\n  распознанные колонки:`);
     for (const [k, v] of Object.entries(s.column_map)) console.log(`    ${k.padEnd(10)} ← "${v}"`);
