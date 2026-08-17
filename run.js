@@ -16,9 +16,19 @@ import { exportAll } from './src/export.js';
 
 // .env без зависимостей
 if (fs.existsSync('.env')) {
+  const commented = [];
   for (const line of fs.readFileSync('.env', 'utf8').split('\n')) {
     const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)$/);
-    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim().replace(/^["']|["']$/g, '');
+    if (m) { if (!process.env[m[1]]) process.env[m[1]] = m[2].trim().replace(/^["']|["']$/g, ''); continue; }
+    // Ключ вписан, но строка закомментирована — самая частая ошибка при настройке:
+    // сервис молча не подключается, и это никак не проявляется.
+    const c = line.match(/^\s*#\s*([A-Z0-9_]*(?:KEY|TOKEN|ID|PROVIDER)[A-Z0-9_]*)\s*=\s*(\S.+)$/);
+    if (c && !/^#/.test(c[2])) commented.push(c[1]);
+  }
+  if (commented.length) {
+    console.log('\n  ⚠️  В файле .env есть заполненные строки, закомментированные знаком #:');
+    for (const k of commented) console.log(`        # ${k}=...`);
+    console.log('      Скрипт их НЕ ВИДИТ. Уберите # в начале этих строк.\n');
   }
 }
 

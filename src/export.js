@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import { unj } from './db.js';
 import { toCSV } from './stages.js';
-import { pickGenericEmail, matchEmailToPerson, parseFio } from './emails.js';
+import { pickGenericEmail, matchEmailToPerson, parseFio, domainPart, relatedToCompany } from './emails.js';
 import { isFreeMail } from './extract.js';
 
 const list = (s) => unj(s) ?? [];
@@ -85,11 +85,13 @@ export function exportAll(db, { dir = 'out', keepPersonal = true } = {}) {
           'Источник ЛПР': { import: 'исходный файл', site: 'сайт компании', search: 'поиск' }[p.origin] ?? p.origin,
           'Ссылка на источник': p.source_url ?? '',
           'Проверка': { true: 'подтверждён', unknown: 'не удалось проверить' }[p.verified] ?? p.verified,
+          'Внимание': relatedToCompany(email, c.name, c.domain) ? ''
+            : `домен ${domainPart(email)} не связан с компанией — проверьте, то ли это юрлицо`,
           ...companyFields(c, d),
         });
       }
     } else {
-      const g = pickGenericEmail(emails, c.domain);
+      const g = pickGenericEmail(emails, c.domain, c.name);
       // для письма на общую почту берём самого релевантного: сначала по должности,
       // иначе руководителя из исходного файла
       const best = relevant[0] ?? staff.find((p) => p.origin === 'import') ?? staff[0];
@@ -98,6 +100,7 @@ export function exportAll(db, { dir = 'out', keepPersonal = true } = {}) {
       t3.push({
         'Общая почта': g.email ?? '',
         'Почему такая': g.reason,
+        'Внимание': g.foreign ? 'домен не связан с компанией — возможно холдинг или дилер' : '',
         'ФИО для письма': best?.full_name ?? '',
         'Имя Отчество (кто)': nom,
         'Имя Отчество (кому)': best?.name_dative ?? '',

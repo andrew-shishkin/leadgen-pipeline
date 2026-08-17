@@ -81,6 +81,13 @@ export function finalReport(db, { title = 'ИТОГИ ПРОГОНА' } = {}) {
     for (const r of ppl) L.push(`    ${(labels[r.origin] ?? r.origin).padEnd(28)}${pad(r.n, 6)}`);
     const withMail = db.prepare(`SELECT COUNT(*) n FROM people WHERE email IS NOT NULL`).get().n;
     if (withMail) L.push(`    ${'с найденной почтой'.padEnd(28)}${pad(withMail, 6)}`);
+    // фильтр по году — самая незаметная причина потерь, показываем её явно
+    const byDate = db.prepare(
+      `SELECT COUNT(*) n FROM people WHERE verified='false' AND verify_reason LIKE '%старше%'`).get().n;
+    if (byDate) {
+      L.push(`    ${'отсеяно по дате публикации'.padEnd(28)}${pad(byDate, 6)}`);
+      L.push(`       если это много — сдвиньте FRESH_SINCE_YEAR в .env (сейчас ${process.env.FRESH_SINCE_YEAR || 2022})`);
+    }
   }
 
   const { rows, total } = costReport(db);
