@@ -109,6 +109,8 @@ function migrate(db) {
   const add = (t, name, decl) => { if (!cols(t).has(name)) db.exec(`ALTER TABLE ${t} ADD COLUMN ${name} ${decl}`); };
   add('companies', 'search_status', 'TEXT');
   add('companies', 'legal_name', 'TEXT');
+  // каким поиском найден человек: yandex или builtin
+  add('people', 'engine', 'TEXT');
   add('people', 'name_nominative', 'TEXT');
   add('people', 'name_dative', 'TEXT');
 }

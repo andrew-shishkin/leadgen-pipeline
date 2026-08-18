@@ -30,6 +30,12 @@ export function searchProviderName() {
   return yandexKeysPresent() ? 'yandex' : 'builtin';
 }
 
+/** Запрос на естественном языке для встроенного поиска: он ходит в гугловый
+ *  индекс и, в отличие от Яндекса, видит LinkedIn. */
+export const builtinQuery = (company, titles) =>
+  `Кто работает в компании «${company.name}» (${company.domain}) на должностях: ` +
+  `${titles.slice(0, 10).join(', ')}. Имена и должности. Смотри в том числе LinkedIn.`;
+
 /** Ключи есть, но выбран другой поиск — сказать вслух, а не молчать. */
 export function searchProviderNote() {
   const set = (process.env.SEARCH_PROVIDER ?? '').trim().toLowerCase();
@@ -327,7 +333,7 @@ async function builtinSearch(client, db, query, { limit = 10 } = {}) {
 export async function search(client, db, query, opts = {}) {
   const provider = searchProviderName();
   if (provider === 'none') return [];
-  if (provider === 'yandex') return yandexSearch(db, query, opts);
-  if (provider === 'builtin') return builtinSearch(client, db, query, opts);
+  if (provider === 'yandex') return (await yandexSearch(db, query, opts)).map((x) => ({ ...x, engine: 'yandex' }));
+  if (provider === 'builtin') return (await builtinSearch(client, db, query, opts)).map((x) => ({ ...x, engine: 'builtin' }));
   throw new Error(`Неизвестный SEARCH_PROVIDER="${provider}". Допустимо: builtin, yandex, none`);
 }

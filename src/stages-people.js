@@ -7,7 +7,7 @@ import { fetchPage, mapLimit } from './http.js';
 import { fetchWithBrowser, browserAvailable } from './browser.js';
 import { htmlToText, extractEmails, cutPeopleFragments } from './extract.js';
 import { askJson, modelName } from './llm.js';
-import { search, buildQueries, searchProviderName } from './search.js';
+import { search, buildQueries, searchProviderName, builtinQuery } from './search.js';
 import { findEmail, validateEmail, activeProviders } from './enrich.js';
 import { matchEmailToPerson, parseFio, looksPersonal } from './emails.js';
 import { loadPrompt } from './stages.js';
@@ -172,9 +172,27 @@ export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
     let failed = 0;
     // в поиск идут и TARGETS, и ALSO_ACCEPT: раз формулировка нам подходит,
     // странно её не искать. Раньше искались только TARGETS.
-    for (const q of buildQueries(c, [...titles.targets, ...titles.accept])) {
-      try { hits.push(...await search(client, db, q.q, { limit: 8 })); }
-      catch (e) { failed++; process.stderr.write(`\n  ! поиск: ${e.message.slice(0, 200)}\n`); }
+    const mode = searchProviderName();
+    const engines = mode === 'both' ? ['yandex', 'builtin'] : [mode];
+    const prev = process.env.SEARCH_PROVIDER;
+    for (const eng of engines) {
+      process.env.SEARCH_PROVIDER = eng;
+      // встроенный поиск сам ходит по выдаче — ему нужен один запрос на компанию,
+      // а не список; Яндексу наоборот нужны точные запросы по одному
+      const qs = eng === 'builtin'
+        ? [{ kind: 'builtin', q: builtinQuery(c, [...titles.targets, ...titles.accept]) }]
+        : buildQueries(c, [...titles.targets, ...titles.accept]);
+      for (const q of qs) {
+        try { hits.push(...await search(client, db, q.q, { limit: 8 })); }
+        catch (e) { failed++; process.stderr.write(`\n  ! поиск(${eng}): ${e.message.slice(0, 160)}\n`); }
+      }
+    }
+    process.env.SEARCH_PROVIDER = prev;
+    // какой движок отдал какой адрес — по этому потом считаем, кто сколько нашёл
+    const engineOf = new Map();
+    for (const h of hits) {
+      if (h.url) engineOf.set(h.url, h.engine);
+      for (const u of h.urls ?? []) engineOf.set(u.url, h.engine);
     }
     // если поиск сломан — НЕ помечаем компанию обработанной, иначе потеряем её молча
     if (failed && !hits.length) { stat.searchErrors = (stat.searchErrors ?? 0) + 1; return; }
@@ -185,7 +203,7 @@ export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
       // Поэтому найденные страницы скачиваем и режем регуляркой — качать
       // бесплатно, резать бесплатно, нейросеть видит только нужные строки.
       const seenUrl = new Set();
-      const urls = hits.map((h) => h.url).filter((u) =>
+      const urls = hits.flatMap((h) => [h.url, ...(h.urls ?? []).map((x) => x.url)]).filter((u) =>
         u && !u.includes(c.domain) && !/\.(pdf|docx?|xlsx?|pptx?|zip|rar)(\?|$)/i.test(u)
           && !seenUrl.has(u) && seenUrl.add(u)).slice(0, PAGE_LIMIT);
       const pages = (await mapLimit(urls, 4, async (u) => {
@@ -210,8 +228,12 @@ export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
       });
       if (r.ok) for (const p of r.data.people ?? []) {
         if (!p.full_name?.trim()) continue;
+        const eng = engineOf.get(p.source_url) ?? (engines.length === 1 ? engines[0] : 'unknown');
         ins.run(c.id, p.full_name.trim(), p.title ?? '', 'search', p.source_url || null,
                 p.published_year ? String(p.published_year) : null);
+        db.prepare(`UPDATE people SET engine=? WHERE company_id=? AND full_name=? AND engine IS NULL`)
+          .run(eng, c.id, p.full_name.trim());
+        stat[eng] = (stat[eng] ?? 0) + 1;
         stat.found++;
       }
     }

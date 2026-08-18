@@ -11,7 +11,7 @@ import { finalReport } from './src/report.js';
 import { enrichPages, retryWithBrowser, peopleFromPages, peopleFromSearch,
          matchTitles, verifyPeople, findEmails, validateEmails, declineNames, loadTitles } from './src/stages-people.js';
 import { browserAvailable, installHint, closeBrowser } from './src/browser.js';
-import { searchProviderName, buildQueries } from './src/search.js';
+import { searchProviderName, buildQueries, yandexKeysPresent } from './src/search.js';
 import { activeProviders } from './src/enrich.js';
 import { exportAll } from './src/export.js';
 import { printCheck, collectStatus } from './src/check.js';
@@ -239,8 +239,35 @@ switch (cmd) {
       if (share < 15) console.log('  ⚠️  Прошло меньше 15% — проверьте критерии, иначе большая часть списка не дойдёт до поиска.');
       const t = loadTitles();
       const qn = buildQueries({ name: 'x', domain: 'x.ru' }, [...t.targets, ...t.accept]).length;
-      console.log(`  Должностей в поиске: ${t.targets.length + t.accept.length} → ${qn} запросов на компанию (${qn * pass} всего).`);
+      console.log(`  Должностей в поиске: ${t.targets.length + t.accept.length} → ${qn} запросов на компанию.`);
       console.log('  Подробнее и чем дополнить список: node run.js titles --suggest');
+
+      // Выбор поисковика. Цены — измеренные, а не придуманные: рубль за запрос
+      // Яндекса взят по факту счёта, стоимость разбора — по таблице usage.
+      const RUB = Number(process.env.YANDEX_PRICE_RUB ?? 0.93);
+      const USD_RUB = Number(process.env.USD_RUB ?? 86);
+      const seen = db.prepare(`SELECT SUM(usd) usd, COUNT(*) n FROM usage WHERE stage='people-search'`).get();
+      const parse = seen?.n ? seen.usd / seen.n : 0.015;          // разбор страниц нейросетью
+      const yandex = qn * RUB / USD_RUB;                           // запросы в Яндекс
+      const google = Number(process.env.BUILTIN_PRICE_USD ?? 0.045); // встроенный поиск, за компанию
+      const money2 = (u) => '$' + u.toFixed(3) + ' (' + Math.round(u * USD_RUB) + ' ₽)';
+      const line = (v) => `${money2(v)} за строку · ${money2(v * pass)} за все ${pass}`;
+
+      let mode = getMeta(db, 'search_mode', null) ?? String(flag('search', '') || '');
+      if (!['yandex', 'builtin', 'both'].includes(mode)) {
+        const opts = [];
+        if (yandexKeysPresent()) opts.push({ value: 'both', label: 'Яндекс + Google — максимум находок',
+          hint: line(yandex + google + parse) + '  · российские площадки и LinkedIn' });
+        opts.push({ value: 'builtin', label: 'только Google (встроенный поиск)',
+          hint: line(google + parse) + '  · видит LinkedIn, ключей не нужно' });
+        if (yandexKeysPresent()) opts.push({ value: 'yandex', label: 'только Яндекс',
+          hint: line(yandex + parse) + '  · российские площадки, LinkedIn не видит' });
+        mode = await ask('Как искать людей?', opts,
+          'Цены посчитаны по вашим фактическим расходам, но зависят от сайтов — считайте их ориентиром.');
+        setMeta(db, 'search_mode', mode);
+      }
+      process.env.SEARCH_PROVIDER = mode;
+      console.log(`  Поиск: ${{ both: 'Яндекс + Google', yandex: 'только Яндекс', builtin: 'только Google' }[mode]}`);
     }
     console.log('\nПоиск ЛПР на страницах компаний...');
     const a = await peopleFromPages(db, client, { model: MODEL, onProgress: bar });
