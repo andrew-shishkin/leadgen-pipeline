@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import { j, unj } from './db.js';
 import { fetchPage, mapLimit } from './http.js';
 import { fetchWithBrowser, browserAvailable } from './browser.js';
-import { htmlToText, extractEmails } from './extract.js';
+import { htmlToText, extractEmails, cutPeopleFragments } from './extract.js';
 import { askJson, modelName } from './llm.js';
 import { search, buildQueries, searchProviderName } from './search.js';
 import { findEmail, validateEmail, activeProviders } from './enrich.js';
@@ -150,6 +150,9 @@ export async function peopleFromPages(db, client, { model, onProgress } = {}) {
   return stat;
 }
 
+/** Сколько найденных страниц скачивать и читать на одну компанию. */
+const PAGE_LIMIT = Number(process.env.SEARCH_PAGES ?? 6);
+
 export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
   if (searchProviderName() === 'none') return { skipped: true };
   const { system, user: tpl } = loadPrompt('prompts/people.md');
@@ -177,8 +180,30 @@ export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
     if (failed && !hits.length) { stat.searchErrors = (stat.searchErrors ?? 0) + 1; return; }
     stat.snippets += hits.length;
     if (hits.length) {
-      const text = hits.map((h, i) =>
-        `${i + 1}. ${h.title}\n   ${h.url}${h.date ? `\n   дата: ${h.date}` : ''}\n   ${h.snippet}`).join('\n\n').slice(0, 18000);
+      // Сниппет Яндекса — сотня символов, имён в нём обычно нет. Страница
+      // компании на TAdviser: 124 КБ текста и 74 строки вида «должность + ФИО».
+      // Поэтому найденные страницы скачиваем и режем регуляркой — качать
+      // бесплатно, резать бесплатно, нейросеть видит только нужные строки.
+      const seenUrl = new Set();
+      const urls = hits.map((h) => h.url).filter((u) =>
+        u && !u.includes(c.domain) && !/\.(pdf|docx?|xlsx?|pptx?|zip|rar)(\?|$)/i.test(u)
+          && !seenUrl.has(u) && seenUrl.add(u)).slice(0, PAGE_LIMIT);
+      const pages = (await mapLimit(urls, 4, async (u) => {
+        try {
+          const r = await fetchPage(u, { timeout: 12000 });
+          if (!r.ok || !r.html) return null;
+          const cut = cutPeopleFragments(htmlToText(r.html));
+          return cut ? `ИСТОЧНИК: ${u}\n${cut}` : null;
+        } catch { return null; }
+      })).filter(Boolean);
+      stat.pagesRead = (stat.pagesRead ?? 0) + pages.length;
+
+      const snippets = hits.map((h, i) =>
+        `${i + 1}. ${h.title}\n   ${h.url}${h.date ? `\n   дата: ${h.date}` : ''}\n   ${h.snippet}`)
+        .join('\n\n').slice(0, 6000);
+      const text = (pages.length
+        ? `ФРАГМЕНТЫ СО СТРАНИЦ (главное — здесь):\n\n${pages.join('\n\n').slice(0, 14000)}\n\nЗАГОЛОВКИ ВЫДАЧИ:\n\n${snippets}`
+        : snippets).slice(0, 20000);
       const r = await askJson(client, db, {
         stage: 'people-search', model, system, schema: PEOPLE_SCHEMA, companyId: c.id, maxTokens: 3000,
         user: fill(tpl, { name: c.name, site: c.site, titles: titleList, text }),

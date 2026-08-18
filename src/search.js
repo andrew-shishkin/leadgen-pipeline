@@ -103,6 +103,10 @@ const ROLE_WORDS = new Set([
 /** Слова-начальники для широкого запроса. */
 const ROLE_HEADS = ['директор', 'руководитель', 'начальник', 'head', 'chief', 'lead'];
 
+/** Оператор «или» у Яндекса — вертикальная черта. Слово OR он ищет как слово,
+ *  из-за чего выдача сокращалась: 5 результатов вместо 10 на том же запросе. */
+const OR = ' | ';
+
 /** Предметные слова из списка должностей: «маркетинг», «дизайн», «продаж».
  *
  *  Нужны для широкого запроса. Список должностей всегда неполный: у человека
@@ -150,7 +154,7 @@ const PEOPLE_SITES = (process.env.PEOPLE_SITES ??
   .split(',').map((x) => x.trim()).filter(Boolean);
 
 /** Сколько отдельных запросов по должностям делать на компанию. */
-const TITLE_QUERIES = Number(process.env.TITLE_QUERIES ?? 8);
+const TITLE_QUERIES = Number(process.env.TITLE_QUERIES ?? 5);
 
 /** Запросы по компании.
  *
@@ -179,16 +183,25 @@ export function buildQueries(company, titles, { maxChars = MAX_QUERY_CHARS } = {
   const out = [];
   if (!short) return out;
 
+  // должности — по одной: точнее ранжирование, чем у любого списка
   for (const t of list.slice(0, TITLE_QUERIES)) out.push({ kind: 'title', q: `"${short}" "${t}"` });
 
-  for (const site of PEOPLE_SITES) out.push({ kind: 'source', q: `site:${site} "${short}"` });
+  // площадки группами по четыре: одна группа — один запрос вместо четырёх
+  for (let i = 0; i < PEOPLE_SITES.length; i += 4) {
+    const group = PEOPLE_SITES.slice(i, i + 4).map((x) => `site:${x}`).join(OR);
+    out.push({ kind: 'source', q: `"${short}" (${group})` });
+  }
 
   const topics = topicWords(list);
   if (topics.length) {
-    out.push({ kind: 'broad', q: `"${short}" (${topics.join(' OR ')}) (${ROLE_HEADS.join(' OR ')})` });
+    out.push({ kind: 'broad', q: `"${short}" (${topics.join(OR)}) (${ROLE_HEADS.join(OR)})` });
   }
   return out.filter((x) => x.q.length <= maxChars);
 }
+
+/** Сколько запросов уйдёт на одну компанию — нужно, чтобы назвать цену заранее. */
+export const queriesPerCompany = (titles) =>
+  buildQueries({ name: 'Компания', domain: 'x.ru' }, titles).length;
 
 // ─────────────────────────── Yandex Cloud Search API ───────────────────────────
 
@@ -268,14 +281,18 @@ async function builtinSearch(client, db, query, { limit = 10 } = {}) {
     // расширенный (_20260209) требует программного вызова инструментов
     tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }],
     system:
-      'Ты выполняешь поисковый запрос и выписываешь из выдачи только факты. ' +
-      'Для каждого найденного результата, где упоминается человек и место его ' +
-      'работы, выпиши строку вида:\n' +
-      'ФИО | должность | адрес источника | год публикации\n' +
-      'Если год неизвестен — поставь 0. Ничего не додумывай и не делай выводов. ' +
-      'Если подходящих упоминаний нет — напиши «ничего не найдено».',
+      'Ты ищешь в интернете сотрудников компании и выписываешь то, что реально ' +
+      'нашлось в выдаче. По каждому найденному человеку дай строку:\n' +
+      'ФИО | должность | адрес источника | год публикации (0, если неизвестен)\n\n' +
+      'Выписывай всех, кто работает в этой компании и чья должность близка ' +
+      'к запрошенной по смыслу: «директор по развитию, отвечает за маркетинг» — ' +
+      'это находка, выписывай. Отсеивать по точности формулировки не нужно, ' +
+      'это сделает следующий шаг.\n\n' +
+      'Ничего не додумывай: человек должен быть назван в найденных источниках. ' +
+      'Если людей не нашлось, коротко напиши, что именно нашлось вместо них.',
     messages: [{ role: 'user', content: `Поисковый запрос:\n${query}` }],
   });
+
   const u = res.usage ?? {};
   logUsage(db, {
     stage: 'search', provider: 'anthropic', model: res.model,
@@ -284,13 +301,16 @@ async function builtinSearch(client, db, query, { limit = 10 } = {}) {
   });
 
   const text = res.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
-  if (!text || /ничего не найдено/i.test(text)) return [];
+  if (!text) return [];
 
   // адреса найденных страниц — из блоков результатов поиска
   const urls = [];
   for (const block of res.content) {
     if (block.type !== 'web_search_tool_result' || !Array.isArray(block.content)) continue;
-    for (const it of block.content) if (it.url) urls.push({ url: it.url, title: it.title ?? '' });
+    for (const it of block.content) {
+      const u = it.url ?? it.page_url ?? it.source;   // поле отличается между версиями инструмента
+      if (u) urls.push({ url: u, title: it.title ?? it.page_title ?? '' });
+    }
   }
 
   // отдаём выписку модели как один «результат»: дальше её разбирает этап people

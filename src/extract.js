@@ -98,3 +98,36 @@ export function extractInternalLinks(html, baseUrl) {
 /** Грубая оценка токенов для русского текста (~3 байта UTF-8 на токен).
  *  Для точных цифр после прогона берём usage из ответа API. */
 export const estimateTokens = (s) => Math.ceil(Buffer.byteLength(s, 'utf8') / 3);
+
+
+/** Роли, по которым узнаём строку про человека. Шире, чем список должностей
+ *  пользователя: отсев по точной формулировке делает следующий шаг. */
+const ROLE_RE = /директор|руководител|начальник|глава|основател|владел|партн[её]р|head\s+of|chief|c\.?[emtfio]\.?o\b|\blead\b|founder|owner|president|vp\b|менеджер|маркетолог|дизайнер/i;
+const NAME_RE = /(?:[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}|[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,})/;
+
+/**
+ * Оставить со страницы только куски, где рядом стоят должность и имя.
+ *
+ * Это главная экономия этапа: страница компании на TAdviser — 124 КБ текста,
+ * а нужных строк там пара килобайт. Всё делается регуляркой, ноль токенов;
+ * нейросети достаётся только то, по чему действительно надо принять решение.
+ */
+export function cutPeopleFragments(text, { max = 4000 } = {}) {
+  if (!text) return '';
+  const parts = String(text).split(/(?<=[.!?;:\n])\s+/);
+  const out = [];
+  let len = 0;
+  const seen = new Set();
+  for (const p of parts) {
+    const t = p.trim();
+    if (t.length < 12 || t.length > 400) continue;
+    if (!ROLE_RE.test(t) || !NAME_RE.test(t)) continue;
+    const key = t.slice(0, 60).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(t);
+    len += t.length;
+    if (len >= max) break;
+  }
+  return out.join('\n');
+}
