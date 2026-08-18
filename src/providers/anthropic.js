@@ -12,6 +12,10 @@ export const defaultModel = 'claude-sonnet-5';
 export const keyEnv = 'ANTHROPIC_API_KEY';
 export const consoleUrl = 'console.anthropic.com';
 
+/** Это имя модели наше? Нужно, чтобы QUALIFY_MODEL от другого провайдера
+ *  не уходил в наш API — см. modelFor в src/llm.js. */
+export const owns = (m) => /^claude/i.test(String(m));
+
 export function price(model, { tokens_in = 0, tokens_out = 0, cache_read = 0, batch = false }) {
   // API иногда возвращает датированный снимок модели (claude-haiku-4-5-20251001)
   // вместо алиаса, которым её запросили. Без этой строки такой ответ молча

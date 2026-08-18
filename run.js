@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 // CLI пайплайна. Каждая команда идемпотентна — перезапуск продолжает с места остановки.
 
+// ПЕРВЫМ импортом: .env должен попасть в process.env раньше, чем остальные
+// модули прочитают из него свои настройки на верхнем уровне. См. src/env.js.
+import { commentedOut } from './src/env.js';
+
 import fs from 'node:fs';
 import { openDb, costReport, unj, setMeta, getMeta } from './src/db.js';
 import { importCsv, fetchHomepages, qualify, collectQualify, toCSV } from './src/stages.js';
@@ -11,28 +15,16 @@ import { finalReport } from './src/report.js';
 import { enrichPages, retryWithBrowser, peopleFromPages, peopleFromSearch,
          matchTitles, verifyPeople, findEmails, validateEmails, declineNames, loadTitles } from './src/stages-people.js';
 import { browserAvailable, installHint, closeBrowser } from './src/browser.js';
-import { searchProviderName, buildQueries, yandexKeysPresent } from './src/search.js';
+import { searchProviderName, buildQueries, builtinQueries, yandexKeysPresent } from './src/search.js';
 import { activeProviders } from './src/enrich.js';
 import { exportAll } from './src/export.js';
 import { printCheck, collectStatus } from './src/check.js';
 import { titlesReport, suggestTitles, importedTitles, filterImported } from './src/titles.js';
 
-// .env без зависимостей
-if (fs.existsSync('.env')) {
-  const commented = [];
-  for (const line of fs.readFileSync('.env', 'utf8').split('\n')) {
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)$/);
-    if (m) { if (!process.env[m[1]]) process.env[m[1]] = m[2].trim().replace(/^["']|["']$/g, ''); continue; }
-    // Ключ вписан, но строка закомментирована — самая частая ошибка при настройке:
-    // сервис молча не подключается, и это никак не проявляется.
-    const c = line.match(/^\s*#\s*([A-Z0-9_]*(?:KEY|TOKEN|ID|PROVIDER)[A-Z0-9_]*)\s*=\s*(\S.+)$/);
-    if (c && !/^#/.test(c[2])) commented.push(c[1]);
-  }
-  if (commented.length) {
-    console.log('\n  ⚠️  В файле .env есть заполненные строки, закомментированные знаком #:');
-    for (const k of commented) console.log(`        # ${k}=...`);
-    console.log('      Скрипт их НЕ ВИДИТ. Уберите # в начале этих строк.\n');
-  }
+if (commentedOut.length) {
+  console.log('\n  ⚠️  В файле .env есть заполненные строки, закомментированные знаком #:');
+  for (const k of commentedOut) console.log(`        # ${k}=...`);
+  console.log('      Скрипт их НЕ ВИДИТ. Уберите # в начале этих строк.\n');
 }
 
 const [cmd, ...args] = process.argv.slice(2);
@@ -237,15 +229,26 @@ switch (cmd) {
         break;
       }
       if (share < 15) console.log('  ⚠️  Прошло меньше 15% — проверьте критерии, иначе большая часть списка не дойдёт до поиска.');
-      const t = loadTitles();
-      const qn = buildQueries({ name: 'x', domain: 'x.ru' }, [...t.targets, ...t.accept]).length;
-      console.log(`  Должностей в поиске: ${t.targets.length + t.accept.length} → ${qn} запросов на компанию.`);
-      console.log('  Подробнее и чем дополнить список: node run.js titles --suggest');
-
-      // Выбор поисковика. Цены — измеренные, а не придуманные: рубль за запрос
-      // Яндекса взят по факту счёта, стоимость разбора — по таблице usage.
+      // Цены — измеренные, а не придуманные: рубль за запрос Яндекса взят
+      // по факту счёта, стоимость разбора — по таблице usage.
       const RUB = Number(process.env.YANDEX_PRICE_RUB ?? 0.93);
       const USD_RUB = Number(process.env.USD_RUB ?? 86);
+
+      const t = loadTitles();
+      const nTitles = t.targets.length + t.accept.length;
+      const qn = buildQueries({ name: 'x', domain: 'x.ru' }, [...t.targets, ...t.accept]).length;
+      console.log(`  Должностей в поиске: ${nTitles} → ${qn} запросов на компанию.`);
+      // Длина списка должностей — это прямая статья расходов, а не настройка
+      // качества: одна должность = один поисковый запрос на КАЖДУЮ компанию.
+      // Пользователь дописывает пять формулировок «на всякий случай» и узнаёт
+      // о цене только из счёта, поэтому говорим до прогона, а не после.
+      if (nTitles) {
+        const perTitle = RUB / USD_RUB;
+        console.log(`  Чем больше должностей — тем дороже обработка: каждая добавляет`);
+        console.log(`  по одному запросу на компанию, это $${perTitle.toFixed(3)} за строку`);
+        console.log(`  и $${(perTitle * pass).toFixed(2)} на ваши ${pass} компаний.`);
+      }
+      console.log('  Подробнее и чем дополнить список: node run.js titles --suggest');
       const seen = db.prepare(`SELECT SUM(usd) usd, COUNT(*) n FROM usage WHERE stage='people-search'`).get();
       const parse = seen?.n ? seen.usd / seen.n : 0.015;          // разбор страниц нейросетью
       const yandex = qn * RUB / USD_RUB;                           // запросы в Яндекс
@@ -253,8 +256,12 @@ switch (cmd) {
       // плюс токены модели, и то и другое уже попадает в usage.stage='search'.
       // Раньше здесь стояла угаданная константа; теперь берём фактический расход
       // на компанию, если он уже накоплен, и грубый ориентир — если нет.
+      // usage пишется по одному вызову, а вызов теперь = один поисковый запрос,
+      // а не вся компания. Поэтому цену за вызов умножаем на число запросов:
+      // без этого встроенный поиск выглядел бы в пятнадцать раз дешевле, чем есть.
       const gSeen = db.prepare(`SELECT SUM(usd) usd, COUNT(*) n FROM usage WHERE stage='search' AND provider='anthropic'`).get();
-      const google = gSeen?.n ? gSeen.usd / gSeen.n : Number(process.env.BUILTIN_PRICE_USD ?? 0.1);
+      const bn = builtinQueries({ name: 'x', domain: 'x.ru' }, [...t.targets, ...t.accept]).length;
+      const google = (gSeen?.n ? gSeen.usd / gSeen.n : Number(process.env.BUILTIN_PRICE_USD ?? 0.02)) * bn;
       const money2 = (u) => '$' + u.toFixed(3) + ' (' + Math.round(u * USD_RUB) + ' ₽)';
       const line = (v) => `${money2(v)} за строку · ${money2(v * pass)} за все ${pass}`;
 

@@ -109,7 +109,7 @@ export function finalReport(db, { title = 'ИТОГИ ПРОГОНА' } = {}) {
     const pass = db.prepare(`SELECT COUNT(*) n FROM companies WHERE icp_status='pass'`).get().n;
     if (pass) {
       L.push(`    ${'компаний без единого ЛПР'.padEnd(28)}${pad(zero, 6)}   из ${pass} подходящих (${Math.round(100 * zero / pass)}%)`);
-      if (zero / pass > 0.4) L.push('       больше 40% — расширьте список должностей или площадки поиска (PEOPLE_SITES в .env)');
+      if (zero / pass > 0.4) L.push('       больше 40% — расширьте список должностей: node run.js titles --suggest');
     }
     // фильтр по году — самая незаметная причина потерь, показываем её явно
     const byDate = db.prepare(

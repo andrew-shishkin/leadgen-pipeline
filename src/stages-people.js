@@ -6,14 +6,17 @@ import { j, unj } from './db.js';
 import { fetchPage, mapLimit } from './http.js';
 import { fetchWithBrowser, browserAvailable } from './browser.js';
 import { htmlToText, extractEmails, cutPeopleFragments } from './extract.js';
-import { askJson, modelName } from './llm.js';
-import { search, buildQueries, searchProviderName, builtinQuery } from './search.js';
+import { askJson, modelName, modelFor } from './llm.js';
+import { search, buildQueries, searchProviderName, builtinQueries } from './search.js';
 import { findEmail, validateEmail, activeProviders } from './enrich.js';
 import { matchEmailToPerson, parseFio, looksPersonal } from './emails.js';
 import { loadPrompt } from './stages.js';
 
 const fill = (t, v) => t.replace(/\{\{(\w+)\}\}/g, (_, k) => v[k] ?? '');
-const cheap = () => process.env.CHEAP_MODEL || (modelName().startsWith('claude') ? 'claude-haiku-4-5' : modelName());
+// дешёвая модель для массовых мелких задач; CHEAP_MODEL тоже проверяется
+// на принадлежность текущему провайдеру — см. modelFor
+const cheap = () => modelFor('CHEAP_MODEL',
+  modelName().startsWith('claude') ? 'claude-haiku-4-5' : modelName());
 
 /** Справочник должностей из prompts/titles.md.
  *  Списки люди пишут по-разному: голыми строками, через дефис, звёздочкой,
@@ -150,8 +153,47 @@ export async function peopleFromPages(db, client, { model, onProgress } = {}) {
   return stat;
 }
 
-/** Сколько найденных страниц скачивать и читать на одну компанию. */
-const PAGE_LIMIT = Number(process.env.SEARCH_PAGES ?? 6);
+/** Сколько найденных страниц скачивать и читать на одну компанию.
+ *  Скачивание и обрезка регуляркой бесплатны, а в модель всё равно уходит
+ *  не больше PAGE_BUDGET символов — поэтому предел щедрый. */
+const PAGE_LIMIT = Number(process.env.SEARCH_PAGES ?? 10);
+
+// Сколько символов каждому блоку в тексте для модели.
+// Раньше был один общий лимит на всё: выписки встроенного поиска клеились
+// в конец общей строки и резались по 6000 символов вместе со сниппетами
+// Яндекса. Восемь яндексовых запросов дают 20-50 тысяч символов, так что
+// выписка Google не доезжала до модели ни разу — оплаченный поиск
+// выбрасывался вызовом .slice(). Теперь у каждого блока свой бюджет.
+const PAGE_BUDGET = 14000;
+const SERP_BUDGET = 4000;
+const NOTE_BUDGET = 5000;
+
+/** Адреса из выдачи — поровну от каждого движка, по очереди.
+ *
+ *  Раньше брались первые PAGE_LIMIT адресов подряд, а в списке первым всегда
+ *  шёл Яндекс со своими 40-60 результатами. Страницы, найденные встроенным
+ *  поиском, не читались никогда. */
+function pickUrls(hits, { limit, skipDomain }) {
+  const bad = (u) => !u || (skipDomain && u.includes(skipDomain))
+    || /\.(pdf|docx?|xlsx?|pptx?|zip|rar)(\?|$)/i.test(u);
+  const queues = new Map();
+  for (const h of hits) {
+    const q = queues.get(h.engine) ?? [];
+    for (const u of [h.url, ...(h.urls ?? []).map((x) => x.url)]) if (!bad(u)) q.push(u);
+    queues.set(h.engine, q);
+  }
+  const lists = [...queues.values()];
+  const seen = new Set(), out = [];
+  const longest = Math.max(0, ...lists.map((l) => l.length));
+  for (let i = 0; i < longest && out.length < limit; i++) {
+    for (const l of lists) {
+      if (i >= l.length || seen.has(l[i])) continue;
+      seen.add(l[i]); out.push(l[i]);
+      if (out.length >= limit) break;
+    }
+  }
+  return out;
+}
 
 export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
   if (searchProviderName() === 'none') return { skipped: true };
@@ -182,9 +224,17 @@ export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
       // поисковых фраз («должность компания»), по одной на каждую нужную
       // должность; Яндексу нужны отдельные точные запросы
       if (eng === 'builtin') {
-        const b = builtinQuery(c, [...titles.targets, ...titles.accept]);
-        try { hits.push(...await search(client, db, b.text, { limit: 8, provider: eng, maxUses: b.maxUses })); }
-        catch (e) { failed++; process.stderr.write(`\n  ! поиск(${eng}): ${e.message.slice(0, 160)}\n`); }
+        // по одному вызову на должность: и внимание модели не размазывается
+        // по восьми поискам сразу, и контекст не оплачивается по кругу
+        const bs = builtinQueries(c, [...titles.targets, ...titles.accept]);
+        const res = await mapLimit(bs, 3, async (b) => {
+          try { return await search(client, db, b.text, { limit: 8, provider: eng, maxUses: 1 }); }
+          catch (e) {
+            failed++; process.stderr.write(`\n  ! поиск(${eng}): ${e.message.slice(0, 160)}\n`);
+            return [];
+          }
+        });
+        for (const r of res) if (Array.isArray(r)) hits.push(...r);
         continue;
       }
       const qs = buildQueries(c, [...titles.targets, ...titles.accept]);
@@ -207,10 +257,7 @@ export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
       // компании на TAdviser: 124 КБ текста и 74 строки вида «должность + ФИО».
       // Поэтому найденные страницы скачиваем и режем регуляркой — качать
       // бесплатно, резать бесплатно, нейросеть видит только нужные строки.
-      const seenUrl = new Set();
-      const urls = hits.flatMap((h) => [h.url, ...(h.urls ?? []).map((x) => x.url)]).filter((u) =>
-        u && !u.includes(c.domain) && !/\.(pdf|docx?|xlsx?|pptx?|zip|rar)(\?|$)/i.test(u)
-          && !seenUrl.has(u) && seenUrl.add(u)).slice(0, PAGE_LIMIT);
+      const urls = pickUrls(hits, { limit: PAGE_LIMIT, skipDomain: c.domain });
       const pages = (await mapLimit(urls, 4, async (u) => {
         try {
           const r = await fetchPage(u, { timeout: 12000 });
@@ -221,12 +268,19 @@ export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
       })).filter(Boolean);
       stat.pagesRead = (stat.pagesRead ?? 0) + pages.length;
 
-      const snippets = hits.map((h, i) =>
+      // выписки встроенного поиска и сниппеты обычной выдачи — разные блоки
+      // с разными бюджетами, иначе один вытесняет другой (см. NOTE_BUDGET)
+      const notes = hits.filter((h) => h.engine === 'builtin')
+        .map((h) => h.snippet).filter(Boolean).join('\n\n').slice(0, NOTE_BUDGET);
+      const snippets = hits.filter((h) => h.engine !== 'builtin').map((h, i) =>
         `${i + 1}. ${h.title}\n   ${h.url}${h.date ? `\n   дата: ${h.date}` : ''}\n   ${h.snippet}`)
-        .join('\n\n').slice(0, 6000);
-      const text = (pages.length
-        ? `ФРАГМЕНТЫ СО СТРАНИЦ (главное — здесь):\n\n${pages.join('\n\n').slice(0, 14000)}\n\nЗАГОЛОВКИ ВЫДАЧИ:\n\n${snippets}`
-        : snippets).slice(0, 20000);
+        .join('\n\n').slice(0, SERP_BUDGET);
+
+      const text = [
+        pages.length && `ФРАГМЕНТЫ СО СТРАНИЦ (главное — здесь):\n\n${pages.join('\n\n').slice(0, PAGE_BUDGET)}`,
+        notes && `НАЙДЕНО ПОИСКОМ (выписки по каждому запросу):\n\n${notes}`,
+        snippets && `ЗАГОЛОВКИ ВЫДАЧИ:\n\n${snippets}`,
+      ].filter(Boolean).join('\n\n');
       const r = await askJson(client, db, {
         stage: 'people-search', model, system, schema: PEOPLE_SCHEMA, companyId: c.id, maxTokens: 3000,
         user: fill(tpl, { name: c.name, site: c.site, titles: titleList, text }),

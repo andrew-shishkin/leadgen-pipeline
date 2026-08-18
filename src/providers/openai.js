@@ -12,6 +12,10 @@ export const defaultModel = process.env.OPENAI_MODEL || 'gpt-5';
 export const keyEnv = 'OPENAI_API_KEY';
 export const consoleUrl = 'platform.openai.com';
 
+/** Это имя модели наше? Нужно, чтобы QUALIFY_MODEL от другого провайдера
+ *  не уходил в наш API — см. modelFor в src/llm.js. */
+export const owns = (m) => /^(gpt|o[1-9]|chatgpt|ft:)/i.test(String(m));
+
 // $ за миллион токенов; переопределяется через OPENAI_PRICE_IN / OPENAI_PRICE_OUT
 const PRICE_IN = Number(process.env.OPENAI_PRICE_IN ?? 1.25);
 const PRICE_OUT = Number(process.env.OPENAI_PRICE_OUT ?? 10);

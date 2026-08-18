@@ -14,7 +14,32 @@ export function getProvider() {
   return p;
 }
 
-export const modelName = () => process.env.QUALIFY_MODEL || getProvider().defaultModel;
+const warned = new Set();
+
+/** Имя модели из .env — но только если оно принадлежит текущему провайдеру.
+ *
+ *  QUALIFY_MODEL и CHEAP_MODEL остаются в .env при переключении LLM_PROVIDER,
+ *  и имя модели одного провайдера уходило в API другого: при
+ *  LLM_PROVIDER=openai запрос уезжал с моделью claude-sonnet-5 и падал
+ *  с «404 The model does not exist». Пользователь меняет одну строку
+ *  и получает ошибку, из которой причина не видна, — поэтому не только
+ *  подставляем правильную модель, но и говорим об этом вслух. */
+export function modelFor(envName, fallback) {
+  const p = getProvider();
+  const set = (process.env[envName] || '').trim();
+  if (!set) return fallback ?? p.defaultModel;
+  if (p.owns(set)) return set;
+  if (!warned.has(envName)) {
+    warned.add(envName);
+    process.stderr.write(
+      `\n  ⚠️  В .env ${envName}=${set} — это модель другого провайдера, ` +
+      `а сейчас выбран ${p.name}.\n      Использую ${fallback ?? p.defaultModel}. ` +
+      `Уберите строку ${envName} или впишите модель ${p.name}.\n\n`);
+  }
+  return fallback ?? p.defaultModel;
+}
+
+export const modelName = () => modelFor('QUALIFY_MODEL');
 export const priceOf = (model, u) => getProvider().price(model, u);
 
 export function makeClient() {
