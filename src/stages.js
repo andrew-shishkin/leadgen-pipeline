@@ -156,19 +156,26 @@ export async function fetchHomepages(db, { limit = 12, only = null, onProgress }
 // Никаких null и union-типов: структурированный вывод их не принимает
 // (enum со значением null → 400 invalid_request_error). Вместо этого —
 // строковые перечисления с явным значением «непонятно».
+// Схема нарочно НЕ привязана к отрасли: что значит «подходит», описано словами
+// в prompts/qualify.md. Раньше поля назывались is_manufacturer/equipment_level,
+// и под каждый новый ICP приходилось лезть в код — обещание «код трогать не надо»
+// не работало.
+//
+//   fits  — главный критерий: подходит / не подходит / по тексту не понять
+//   extra — второй критерий, если он у вас есть. Если критерий один,
+//           модель ставит not_applicable, и он ни на что не влияет.
 export const QUALIFY_SCHEMA = {
   type: 'object',
   properties: {
-    is_manufacturer:     { type: 'string', enum: ['yes', 'no', 'unknown'] },
-    manufacturer_reason: { type: 'string' },
-    equipment_level:     { type: 'string', enum: ['high', 'low', 'unclear', 'not_applicable'] },
-    equipment_reason:    { type: 'string' },
-    production_type:     { type: 'string' },
-    evidence:            { type: 'array', items: { type: 'string' } },
-    needs_review:        { type: 'boolean' },
+    fits:         { type: 'string', enum: ['yes', 'no', 'unknown'] },
+    fits_reason:  { type: 'string' },
+    extra:        { type: 'string', enum: ['yes', 'no', 'unclear', 'not_applicable'] },
+    extra_reason: { type: 'string' },
+    category:     { type: 'string' },
+    evidence:     { type: 'array', items: { type: 'string' } },
+    needs_review: { type: 'boolean' },
   },
-  required: ['is_manufacturer', 'manufacturer_reason', 'equipment_level',
-             'equipment_reason', 'production_type', 'evidence', 'needs_review'],
+  required: ['fits', 'fits_reason', 'extra', 'extra_reason', 'category', 'evidence', 'needs_review'],
   additionalProperties: false,
 };
 
@@ -224,16 +231,34 @@ export async function qualify(db, client, { model, batch = false, wait = true, o
   return stat;
 }
 
+/** Понять и новый формат ответа, и старый (is_manufacturer/equipment_level),
+ *  чтобы базы, собранные до переименования полей, продолжали читаться. */
+export function normalizeVerdict(d) {
+  if (!d || d.fits !== undefined) return d ?? {};
+  const LVL = { high: 'yes', low: 'no', unclear: 'unclear', not_applicable: 'not_applicable' };
+  return {
+    fits: d.is_manufacturer ?? 'unknown',
+    fits_reason: d.manufacturer_reason ?? '',
+    extra: LVL[d.equipment_level] ?? 'not_applicable',
+    extra_reason: d.equipment_reason ?? '',
+    category: d.production_type ?? '',
+    evidence: d.evidence ?? [],
+    needs_review: d.needs_review ?? false,
+  };
+}
+
 /** Записать вердикт по одной компании. «Под вопросом» — отдельный статус, не отбраковка. */
 function applyQualify(db, id, r) {
   const upd = db.prepare(`UPDATE companies SET icp_status=?, icp_json=?, icp_reason=? WHERE id=?`);
   if (!r?.ok) { upd.run('error', j(r ?? null), r?.error ?? 'unknown', id); return 'error'; }
-  const d = r.data;
+  const d = normalizeVerdict(r.data);
+  // «Под вопросом» — отдельная корзина, а не отбраковка: по таким компаниям
+  // судить нельзя, и терять их молча дороже, чем просмотреть глазами.
   const status =
-    d.is_manufacturer === 'yes'
-      ? (d.equipment_level === 'high' ? 'pass' : d.equipment_level === 'unclear' ? 'unclear' : 'fail')
-      : d.is_manufacturer === 'unknown' ? 'unclear' : 'fail';
-  upd.run(status, j(d), [d.manufacturer_reason, d.equipment_reason].filter(Boolean).join(' | '), id);
+    d.fits === 'yes'
+      ? (d.extra === 'no' ? 'fail' : d.extra === 'unclear' ? 'unclear' : 'pass')
+      : d.fits === 'unknown' ? 'unclear' : 'fail';
+  upd.run(status, j(d), [d.fits_reason, d.extra_reason].filter(Boolean).join(' | '), id);
   return status;
 }
 

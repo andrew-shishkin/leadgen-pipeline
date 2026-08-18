@@ -3,7 +3,7 @@
 
 import fs from 'node:fs';
 import { unj } from './db.js';
-import { toCSV } from './stages.js';
+import { toCSV, normalizeVerdict } from './stages.js';
 import { pickGenericEmail, matchEmailToPerson, parseFio, domainPart, relatedToCompany } from './emails.js';
 import { isFreeMail } from './extract.js';
 
@@ -18,7 +18,7 @@ const companyFields = (c, d) => ({
   'Сайт': c.site,
   'Домен': c.domain,
   'Телефоны': list(c.phones).join(', '),
-  'Что производит': d.production_type ?? '',
+  'Чем занимается': d.category ?? '',
   'Руководитель': c.ceo_name ?? '',
   'Должность руководителя': c.ceo_title ?? '',
 });
@@ -35,14 +35,14 @@ export function exportAll(db, { dir = 'out', keepPersonal = true } = {}) {
 
   // ── 1. Компании ──
   const t1 = companies.map((c) => {
-    const d = unj(c.icp_json) ?? {};
+    const d = normalizeVerdict(unj(c.icp_json) ?? {});
     return {
       'Компания': c.name, 'Юрлицо': c.legal_name ?? '', 'ИНН': c.inn, 'Сайт': c.site, 'Домен': c.domain,
       'Подходит под ICP': { pass: 'да', fail: 'нет', unclear: 'под вопросом',
                             error: 'ошибка', pending: 'не проверяли' }[c.icp_status] ?? c.icp_status,
-      'Производитель': { yes: 'да', no: 'нет', unknown: 'непонятно' }[d.is_manufacturer] ?? '',
-      'Станкоёмкость': d.equipment_level ?? '',
-      'Что производит': d.production_type ?? '',
+      'Главный критерий': { yes: 'да', no: 'нет', unknown: 'непонятно' }[d.fits] ?? '',
+      'Второй критерий': { yes: 'да', no: 'нет', unclear: 'непонятно', not_applicable: '—' }[d.extra] ?? '',
+      'Чем занимается': d.category ?? '',
       'Обоснование': c.icp_reason ?? '',
       'Цитаты с сайта': (d.evidence ?? []).join(' // '),
       'Руководитель': c.ceo_name ?? '', 'Должность руководителя': c.ceo_title ?? '',
@@ -57,7 +57,7 @@ export function exportAll(db, { dir = 'out', keepPersonal = true } = {}) {
   const t2 = [], t3 = [];
   for (const c of companies) {
     if (c.icp_status !== 'pass') continue;          // ищем только по подходящим
-    const d = unj(c.icp_json) ?? {};
+    const d = normalizeVerdict(unj(c.icp_json) ?? {});
     const emails = allEmails(c);
     const staff = byCompany.get(c.id) ?? [];
 
