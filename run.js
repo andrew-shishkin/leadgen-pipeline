@@ -8,12 +8,13 @@ import { makeClient, modelName, getProvider } from './src/llm.js';
 import readline from 'node:readline/promises';
 import { finalReport } from './src/report.js';
 import { enrichPages, retryWithBrowser, peopleFromPages, peopleFromSearch,
-         matchTitles, verifyPeople, findEmails, validateEmails, declineNames } from './src/stages-people.js';
+         matchTitles, verifyPeople, findEmails, validateEmails, declineNames, loadTitles } from './src/stages-people.js';
 import { browserAvailable, installHint, closeBrowser } from './src/browser.js';
-import { searchProviderName } from './src/search.js';
+import { searchProviderName, buildQueries } from './src/search.js';
 import { activeProviders } from './src/enrich.js';
 import { exportAll } from './src/export.js';
 import { printCheck } from './src/check.js';
+import { titlesReport, suggestTitles } from './src/titles.js';
 
 // .env без зависимостей
 if (fs.existsSync('.env')) {
@@ -63,7 +64,7 @@ async function chooseMode(n, perRow) {
 switch (cmd) {
 
   case 'import': {
-    const file = flag('file', 'data/sample-companies.csv');
+    const file = flag('file', 'data/companies.csv');
     const s = importCsv(db, file);
     console.log(`\nИмпорт из ${file}`);
     console.log(`  строк в файле:      ${s.total}`);
@@ -167,6 +168,24 @@ switch (cmd) {
 
   case 'people': {
     const client = makeClient();
+    // Молчаливый ноль здесь дороже всего: если ICP отсеял почти всех,
+    // искать некого, и это надо сказать до того, как этап отчитается «0 людей».
+    {
+      const pass = db.prepare(`SELECT COUNT(*) n FROM companies WHERE icp_status='pass'`).get().n;
+      const all  = db.prepare('SELECT COUNT(*) n FROM companies').get().n;
+      const share = all ? Math.round(100 * pass / all) : 0;
+      console.log(`\nЛПР ищем только по компаниям, прошедшим ICP: ${pass} из ${all} (${share}%)`);
+      if (!pass) {
+        console.log('  Прошедших нет — искать не по кому. Дело не в должностях, а в критериях');
+        console.log('  отбора: посмотрите prompts/qualify.md и колонку «Обоснование» в out/1-компании.csv.');
+        break;
+      }
+      if (share < 15) console.log('  ⚠️  Прошло меньше 15% — проверьте критерии, иначе большая часть списка не дойдёт до поиска.');
+      const t = loadTitles();
+      const qn = buildQueries({ name: 'x', domain: 'x.ru' }, [...t.targets, ...t.accept]).length;
+      console.log(`  Должностей в поиске: ${t.targets.length + t.accept.length} → ${qn} запросов на компанию (${qn * pass} всего).`);
+      console.log('  Подробнее и чем дополнить список: node run.js titles --suggest');
+    }
     console.log('\nПоиск ЛПР на страницах компаний...');
     const a = await peopleFromPages(db, client, { model: MODEL, onProgress: bar });
     console.log(`\n  компаний обработано: ${a.companies ?? 0}   найдено людей: ${a.found ?? 0}`);
@@ -244,6 +263,12 @@ switch (cmd) {
     break;
   }
 
+  case 'titles': {
+    titlesReport(db);
+    if (has('suggest')) await suggestTitles(db, makeClient(), { model: MODEL });
+    break;
+  }
+
   case 'report': {
     finalReport(db, { title: 'ТЕКУЩЕЕ СОСТОЯНИЕ' });
     break;
@@ -271,6 +296,7 @@ switch (cmd) {
   node run.js emails                                  подобрать, купить и проверить почты
   node run.js browser                                 добрать сайты на JS (нужен Playwright)
   node run.js check                                   что настроено, чего не хватает
+  node run.js titles [--suggest]                      список должностей: отчёт и чем дополнить
   node run.js report                                  статус и расходы
   node run.js export                                  три CSV в out/
 

@@ -83,16 +83,84 @@ function caseForms(title) {
   return [...out];
 }
 
-/** Два запроса на компанию: по сайту и по названию рядом с должностью. */
-export function buildQueries(company, titles) {
+// Предел длины запроса у Яндекса — 400 символов. Берём с запасом: всё, что
+// не влезло, раньше просто пропадало, и должности из конца списка в поиск
+// не попадали вообще.
+const MAX_QUERY_CHARS = 380;
+
+/** Слова, которые означают «начальник», а не предметную область. */
+const ROLE_WORDS = new Set([
+  'директор', 'директора', 'директором', 'руководитель', 'руководителя', 'начальник',
+  'начальника', 'глава', 'главы', 'заместитель', 'зам', 'ведущий', 'главный', 'старший',
+  'менеджер', 'специалист', 'сотрудник', 'по', 'и', 'отдел', 'отдела', 'департамент',
+  'департамента', 'управление', 'управления', 'дирекции', 'дирекция', 'службы', 'служба',
+  'группы', 'группа', 'направления', 'подразделения',
+  'head', 'of', 'chief', 'officer', 'lead', 'leader', 'director', 'manager', 'managing',
+  'senior', 'principal', 'vp', 'vice', 'president', 'executive', 'and', 'the',
+  'department', 'team', 'global',
+]);
+
+/** Слова-начальники для широкого запроса. */
+const ROLE_HEADS = ['директор', 'руководитель', 'начальник', 'head', 'chief', 'lead'];
+
+/** Предметные слова из списка должностей: «маркетинг», «дизайн», «продаж».
+ *
+ *  Нужны для широкого запроса. Список должностей всегда неполный: у человека
+ *  в профиле может стоять «Руководитель отдела маркетинга», хотя в списке
+ *  написано «Директор по маркетингу». Точные фразы такого не находят,
+ *  а «маркетинг + руководитель» находит. */
+export function topicWords(titles, limit = 6) {
+  const count = new Map();      // ключ — грубая основа слова, чтобы
+  const sample = new Map();     // «маркетинга» и «маркетингу» не считались раздельно
+  for (const t of titles) {
+    for (const w of String(t).toLowerCase().split(/[^\p{L}]+/u)) {
+      if (w.length < 3 || ROLE_WORDS.has(w)) continue;
+      const stem = w.slice(0, 5);
+      count.set(stem, (count.get(stem) ?? 0) + 1);
+      if (!sample.has(stem)) sample.set(stem, w);
+    }
+  }
+  return [...count.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([stem]) => sample.get(stem));
+}
+
+/** Разложить фразы по нескольким запросам так, чтобы ни одна не потерялась. */
+function packPhrases(prefix, phrases, maxChars) {
+  const out = [];
+  let cur = [];
+  const size = (arr) => prefix.length + 2 + arr.join(' OR ').length + 1;
+  for (const p of phrases) {
+    const quoted = `"${p}"`;
+    if (cur.length && size([...cur, quoted]) > maxChars) { out.push(cur); cur = []; }
+    cur.push(quoted);
+  }
+  if (cur.length) out.push(cur);
+  return out.map((arr) => `${prefix} (${arr.join(' OR ')})`);
+}
+
+/** Запросы по компании. Их несколько: список должностей в один не помещается.
+ *
+ *  Падежи не перебираем. Яндекс сам склоняет слова внутри кавычек — запросы
+ *  "арт-директор" и "арт-директора" дают одну и ту же выдачу (проверено).
+ *  Раньше три формы на каждую должность съедали две трети длины запроса. */
+export function buildQueries(company, titles, { maxChars = MAX_QUERY_CHARS } = {}) {
   const domain = company.domain;
-  const short = (company.name ?? '').replace(/^(ООО|АО|ПАО|ЗАО|ОАО|НПО|ТД)\s*/i, '').replace(/["«»]/g, '').trim();
-  const roles = titles.flatMap(caseForms);
-  const roleGroup = roles.map((r) => `"${r}"`).join(' OR ');
-  return [
-    { kind: 'site',    q: `site:${domain} (${titles.map((t) => `"${t}"`).join(' OR ')})` },
-    { kind: 'company', q: `"${short}" (${roleGroup})` },
-  ];
+  const short = (company.name ?? '')
+    .replace(/^(ООО|АО|ПАО|ЗАО|ОАО|НПО|ТД)\s*/i, '').replace(/["«»]/g, '').trim();
+  const list = [...new Set(titles.map((t) => String(t).trim()).filter(Boolean))];
+  const out = [];
+  if (!list.length) return out;
+
+  if (domain) for (const q of packPhrases(`site:${domain}`, list, maxChars)) out.push({ kind: 'site', q });
+  if (short)  for (const q of packPhrases(`"${short}"`,    list, maxChars)) out.push({ kind: 'company', q });
+
+  const topics = topicWords(list);
+  if (short && topics.length) {
+    out.push({ kind: 'broad', q: `"${short}" (${topics.join(' OR ')}) (${ROLE_HEADS.join(' OR ')})` });
+  }
+  return out;
 }
 
 // ─────────────────────────── Yandex Cloud Search API ───────────────────────────

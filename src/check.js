@@ -4,8 +4,14 @@
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { searchProviderName, yandexKeysPresent, searchProviderNote } from './search.js';
+import { loadTitles } from './stages-people.js';
 
 const sha = (s) => crypto.createHash('sha256').update(s.replace(/\r\n/g, '\n').trim()).digest('hex').slice(0, 16);
+/** 1 формулировка, 2 формулировки, 5 формулировок */
+const plural = (n, one, few, many) => {
+  const a = n % 100, b = n % 10;
+  return a > 10 && a < 20 ? many : b === 1 ? one : b >= 2 && b <= 4 ? few : many;
+};
 const has = (k) => (process.env[k] ?? '').trim().length > 5;
 
 /** Промпт ещё в исходном виде? Сверяем с отпечатками, снятыми при сборке шаблона. */
@@ -88,6 +94,19 @@ export function printCheck(db) {
     } else if (p.untouched === false) {
       L.push(`    ✅ ${name} — отредактирован`);
       done.push(name === 'qualify.md' ? 'критерии отбора' : 'список должностей');
+      // Короткий список должностей — самая частая причина «нашли мало людей»:
+      // чего в нём нет, того поиск не найдёт вообще.
+      if (name === 'titles.md') {
+        try {
+          const t = loadTitles();
+          const n = t.targets.length + t.accept.length;
+          if (n < 12) {
+            L.push(`    ⚠️  в поиск уходит всего ${n} ${plural(n, 'формулировка', 'формулировки', 'формулировок')} — этого мало, одну роль`);
+            L.push('        в источниках называют 3-5 способами. Расширить: node run.js titles --suggest');
+            todo.push('расширить список должностей');
+          }
+        } catch { /* файл ещё не читается — скажет отдельная проверка */ }
+      }
     }
     else L.push(`    ❔ ${name} — не с чем сверить`);
   }

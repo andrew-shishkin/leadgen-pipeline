@@ -167,7 +167,9 @@ export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
   await mapLimit(rows, 3, async (c) => {
     const hits = [];
     let failed = 0;
-    for (const q of buildQueries(c, titles.targets)) {
+    // в поиск идут и TARGETS, и ALSO_ACCEPT: раз формулировка нам подходит,
+    // странно её не искать. Раньше искались только TARGETS.
+    for (const q of buildQueries(c, [...titles.targets, ...titles.accept])) {
       try { hits.push(...await search(client, db, q.q, { limit: 8 })); }
       catch (e) { failed++; process.stderr.write(`\n  ! поиск: ${e.message.slice(0, 200)}\n`); }
     }
