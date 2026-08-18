@@ -2,9 +2,9 @@
 // они нужны как переменные в письмах и при импорте в CRM.
 
 import fs from 'node:fs';
-import { unj } from './db.js';
+import { unj, getMeta } from './db.js';
 import { toCSV, normalizeVerdict } from './stages.js';
-import { pickGenericEmail, matchEmailToPerson, parseFio, domainPart, relatedToCompany } from './emails.js';
+import { pickGenericEmail, matchEmailToPerson, parseFio, domainPart, relatedToCompany, classifyMailbox } from './emails.js';
 import { isFreeMail } from './extract.js';
 
 const list = (s) => unj(s) ?? [];
@@ -23,7 +23,13 @@ const companyFields = (c, d) => ({
   'Должность руководителя': c.ceo_title ?? '',
 });
 
-export function exportAll(db, { dir = 'out', keepPersonal = true } = {}) {
+export function exportAll(db, { dir = 'out', keepPersonal = true, generic, departments } = {}) {
+  // Что забирать с сайтов, кроме именных почт, — решает пользователь.
+  const wantGeneric = generic ?? getMeta(db, 'export_generic', 'true') !== 'false';
+  const wantDept    = departments ?? getMeta(db, 'export_departments', 'false') === 'true';
+  // В списке ЛПР третья таблица — это люди без личной почты, а не компании:
+  // писать на info@ всё равно придётся конкретному человеку.
+  const perPerson = getMeta(db, 'list_kind', 'companies') === 'people';
   fs.mkdirSync(dir, { recursive: true });
   const companies = db.prepare(`SELECT * FROM companies ORDER BY icp_status, name`).all();
   const people = db.prepare(`SELECT * FROM people`).all();
@@ -85,22 +91,30 @@ export function exportAll(db, { dir = 'out', keepPersonal = true } = {}) {
           'Статус почты': p.email_status ?? 'не проверялась',
           'Источник ЛПР': { import: 'исходный файл', site: 'сайт компании', search: 'поиск' }[p.origin] ?? p.origin,
           'Ссылка на источник': p.source_url ?? '',
-          'Проверка': { true: 'подтверждён', unknown: 'не удалось проверить' }[p.verified] ?? p.verified,
+          'Проверка': { true: 'подтверждён', unknown: 'не удалось проверить', trusted: 'из вашего файла' }[p.verified] ?? p.verified,
           'Внимание': relatedToCompany(email, c.name, c.domain) ? ''
             : `домен ${domainPart(email)} не связан с компанией — проверьте, то ли это юрлицо`,
           ...companyFields(c, d),
         });
       }
-    } else {
-      const g = pickGenericEmail(emails, c.domain, c.name);
-      // для письма на общую почту берём самого релевантного: сначала по должности,
-      // иначе руководителя из исходного файла
-      const best = relevant[0] ?? staff.find((p) => p.origin === 'import') ?? staff[0];
+    }
+    if (!wantGeneric && !wantDept) continue;
+
+    const g = wantGeneric ? pickGenericEmail(emails, c.domain, c.name) : { email: null, reason: 'общие почты не запрашивались' };
+    const dept = wantDept ? emails.filter((e) => classifyMailbox(e) === 'department') : [];
+    // без личной почты остались вот эти — им и писать на общий ящик
+    const withoutEmail = perPerson ? relevant.filter((p) => !withEmail.some((w) => w.p.id === p.id)) : [];
+    const fallback = relevant[0] ?? staff.find((p) => p.origin === 'import') ?? staff[0];
+    const targets = perPerson ? withoutEmail : (withEmail.length ? [] : [fallback]);
+
+    for (const best of targets) {
+      if (!best && perPerson) continue;
       const f = best ? parseFio(best.full_name) : null;
       const nom = best?.name_nominative || [f?.first, f?.patronymic].filter(Boolean).join(' ');
-      t3.push({
-        'Общая почта': g.email ?? '',
-        'Почему такая': g.reason,
+      const row = {};
+      if (wantGeneric) { row['Общая почта'] = g.email ?? ''; row['Почему такая'] = g.reason; }
+      if (wantDept) row['Почты отделов'] = dept.join(', ');
+      Object.assign(row, {
         'Внимание': g.foreign ? 'домен не связан с компанией — возможно холдинг или дилер' : '',
         'ФИО для письма': best?.full_name ?? '',
         'Имя Отчество (кто)': nom,
@@ -109,6 +123,7 @@ export function exportAll(db, { dir = 'out', keepPersonal = true } = {}) {
         ...companyFields(c, d),
         'Все почты': emails.join(', '),
       });
+      t3.push(row);
     }
   }
 
@@ -121,7 +136,8 @@ export function exportAll(db, { dir = 'out', keepPersonal = true } = {}) {
   return {
     companies: write('1-компании.csv', t1),
     people:    write('2-ЛПР-с-почтами.csv', t2),
-    generic:   write('3-общие-почты.csv', t3),
-    withGeneric: t3.filter((r) => r['Общая почта']).length,
+    generic:   write(perPerson ? '3-ЛПР-без-личной-почты.csv' : '3-общие-почты.csv', t3),
+    withGeneric: t3.filter((r) => r['Общая почта'] || r['Почты отделов']).length,
+    perPerson, wantGeneric, wantDept,
   };
 }

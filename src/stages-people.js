@@ -342,21 +342,31 @@ const MATCH_SCHEMA = {
   required: ['matches'], additionalProperties: false,
 };
 
-export async function findEmails(db, client, { model, buy = true, onProgress } = {}) {
+/**
+ * Подбор почт. Источник выбирает пользователь:
+ *   site      — только то, что нашлось на сайтах (бесплатно, находит меньше)
+ *   providers — только платные сервисы (сайты не нужны)
+ *   both      — сначала бесплатно, платно только за остаток (по умолчанию)
+ */
+export async function findEmails(db, client, { model, buy = true, source, limit, onProgress } = {}) {
+  const src = (source ?? process.env.EMAIL_SOURCES ?? 'both').toLowerCase();
+  const useSite = src !== 'providers';
+  const usePaid = buy && src !== 'site';
   const keep = (process.env.KEEP_PERSONAL_EMAILS ?? 'true') !== 'false';
   const setEmail = db.prepare(`UPDATE people SET email=?, email_source=? WHERE id=?`);
-  const stat = { matched: 0, byLlm: 0, bought: 0, notFound: 0, providers: activeProviders().map((p) => p.name) };
+  const stat = { matched: 0, byLlm: 0, bought: 0, notFound: 0, source: src,
+                 providers: activeProviders().map((p) => p.name) };
 
   const companies = db.prepare(`
     SELECT DISTINCT c.id, c.name, c.domain, c.emails_import, c.emails_site
     FROM companies c JOIN people p ON p.company_id=c.id
-    WHERE c.icp_status='pass' AND p.verified IN ('true','unknown') AND p.title_match='pass' AND p.email IS NULL`).all();
+    WHERE c.icp_status='pass' AND p.verified IN ('true','unknown','trusted') AND p.title_match='pass' AND p.email IS NULL`).all();
 
-  for (const c of companies) {
+  for (const c of useSite ? companies : []) {
     const emails = [...new Set([...(unj(c.emails_import) ?? []), ...(unj(c.emails_site) ?? [])].map((e) => e.toLowerCase()))];
     const staff = db.prepare(`
       SELECT id, full_name, title FROM people
-      WHERE company_id=? AND email IS NULL AND title_match='pass' AND verified IN ('true','unknown')`).all(c.id);
+      WHERE company_id=? AND email IS NULL AND title_match='pass' AND verified IN ('true','unknown','trusted')`).all(c.id);
 
     // 9.1 шаблоны — бесплатно
     const left = [];
@@ -406,17 +416,21 @@ export async function findEmails(db, client, { model, buy = true, onProgress } =
   }
 
   // 9.3 waterfall — платно, только для оставшихся
-  if (buy && activeProviders().length) {
+  if (usePaid && activeProviders().length) {
     const rest = db.prepare(`
       SELECT p.id, p.full_name, c.domain, c.name AS company FROM people p JOIN companies c ON c.id=p.company_id
-      WHERE c.icp_status='pass' AND p.email IS NULL AND p.title_match='pass' AND p.verified IN ('true','unknown')`).all();
+      WHERE c.icp_status='pass' AND p.email IS NULL AND p.title_match='pass' AND p.verified IN ('true','unknown','trusted')
+      ${limit ? 'LIMIT ' + Number(limit) : ''}`).all();
+    stat.paidQueue = rest.length;
+    // асинхронные сервисы отвечают не сразу — без этой строки этап выглядит зависшим
+    process.stdout.write(`\n  платный поиск: ${rest.length} человек, сервисы отвечают не мгновенно\n`);
     await mapLimit(rest, 3, async (p) => {
       const f = parseFio(p.full_name);
       const r = await findEmail(db, { first: f?.first ?? '', last: f?.last ?? '', full: p.full_name, domain: p.domain, company: p.company });
       if (r.email && (keep || !/(mail|ya|yandex|bk|inbox|list|rambler|gmail)\./.test(r.email.split('@')[1] ?? ''))) {
         setEmail.run(r.email, r.source, p.id); stat.bought++;
       } else stat.notFound++;
-    });
+    }, onProgress);
   }
   return stat;
 }

@@ -168,6 +168,25 @@ const DEPARTMENT_WORDS = [
   'tender', 'opt', 'shop', 'magazin', 'dogovor', 'arenda', 'logist', 'tnp',
 ];
 
+/** Ящики отделов и функций, которые в выгрузке считаются «почтой отдела». */
+const DEPARTMENT_EXTRA = [
+  'sales', 'sale', 'marketing', 'market', 'pr', 'hr', 'jobs', 'job', 'vacancy',
+  'rabota', 'support', 'help', 'service', 'order', 'orders', 'zakaz', 'zakupki',
+  'tender', 'tenders', 'billing', 'legal', 'account', 'partners', 'partner',
+];
+
+/**
+ * Что это за ящик: общий (info@), отдела (marketing@) или именной.
+ * Нужно, чтобы пользователь мог решить, какие типы забирать в выгрузку.
+ */
+export function classifyMailbox(email) {
+  const lp = localPart(email).replace(/[._-]/g, '').replace(/\d+$/, '');
+  if (!lp) return 'other';
+  if (GENERIC_PRIORITY.includes(lp)) return 'generic';
+  if (DEPARTMENT_WORDS.includes(lp) || DEPARTMENT_EXTRA.includes(lp)) return 'department';
+  return 'other';
+}
+
 /**
  * Похожа ли почта на личную почту ИМЕННО этого человека.
  * Нейросеть охотно раздаёт отделы за именные ящики и может назначить один

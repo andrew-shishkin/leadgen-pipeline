@@ -92,6 +92,9 @@ export function openDb(file = 'out/leadgen.db') {
       created_at TEXT DEFAULT (datetime('now'))
     );
 
+    -- что это за прогон: список компаний или список ЛПР, что выбрал пользователь
+    CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+
     CREATE INDEX IF NOT EXISTS ix_comp_fetch  ON companies(fetch_status);
     CREATE INDEX IF NOT EXISTS ix_comp_icp    ON companies(icp_status);
     CREATE INDEX IF NOT EXISTS ix_people_comp ON people(company_id);
@@ -109,6 +112,12 @@ function migrate(db) {
   add('people', 'name_nominative', 'TEXT');
   add('people', 'name_dative', 'TEXT');
 }
+
+export const setMeta = (db, k, v) =>
+  db.prepare('INSERT INTO meta (k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v').run(k, String(v));
+export const getMeta = (db, k, dflt = null) => {
+  try { return db.prepare('SELECT v FROM meta WHERE k=?').get(k)?.v ?? dflt; } catch { return dflt; }
+};
 
 export const j = (v) => JSON.stringify(v ?? null);
 export const unj = (s) => { try { return JSON.parse(s); } catch { return null; } };

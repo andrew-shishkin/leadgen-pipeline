@@ -2,8 +2,9 @@
 // CLI пайплайна. Каждая команда идемпотентна — перезапуск продолжает с места остановки.
 
 import fs from 'node:fs';
-import { openDb, costReport, unj } from './src/db.js';
+import { openDb, costReport, unj, setMeta, getMeta } from './src/db.js';
 import { importCsv, fetchHomepages, qualify, collectQualify, toCSV } from './src/stages.js';
+import { j } from './src/db.js';
 import { makeClient, modelName, getProvider } from './src/llm.js';
 import readline from 'node:readline/promises';
 import { finalReport } from './src/report.js';
@@ -43,19 +44,44 @@ const bar = (d, t) => process.stdout.write(`\r  ${d}/${t} (${Math.round(100 * d 
 const money = (u) => '$' + u.toFixed(u < 1 ? 4 : 2);
 
 
+/** Вопрос с пронумерованными вариантами. Возвращает value выбранного.
+ *  Если ввода нет (запуск не из терминала) — берём первый вариант и говорим
+ *  об этом вслух, иначе прогон повисает на невидимом вопросе. */
+async function ask(title, options, note) {
+  console.log(`\n  ${title}`);
+  if (note) console.log(`  ${note}`);
+  options.forEach((o, i) => {
+    console.log(`    ${i + 1} — ${o.label}`);
+    if (o.hint) console.log(`        ${o.hint}`);
+  });
+  if (!process.stdin.isTTY) {
+    console.log(`\n  Запуск не из терминала — беру вариант 1: ${options[0].label}`);
+    return options[0].value;
+  }
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const a = (await rl.question(`\n  Ваш выбор (1-${options.length}): `)).trim();
+  rl.close();
+  const i = Number(a) - 1;
+  return options[Number.isInteger(i) && options[i] ? i : 0].value;
+}
+
 // Спросить пользователя, как запускать: быстро или вдвое дешевле.
 // Ничего платного не стартует без явного ответа.
 async function chooseMode(n, perRow) {
   if (has('batch')) return 'batch';
   if (has('now')) return 'now';
   const est = perRow ? perRow * n : null;
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   console.log(`\n  Компаний к обработке: ${n}`);
   if (est) console.log(`  Ориентировочная стоимость: ${money(est)} обычным способом, ${money(est / 2)} пакетом\n`);
   console.log('  1 — обычный режим: ответ сразу, примерно ' + Math.max(1, Math.round(n / 60)) + ' мин. Ноутбук держим открытым.');
   console.log('  2 — пакетный режим: ВДВОЕ ДЕШЕВЛЕ, но ответ в течение часа (максимум 24 ч).');
   console.log('      Считает сервер провайдера, не ваш компьютер — ноутбук можно закрыть');
   console.log('      и выключить. Результат заберёте командой: node run.js collect\n');
+  if (!process.stdin.isTTY) {
+    console.log('  Запуск не из терминала — беру обычный режим. Пакетный: --batch\n');
+    return 'now';
+  }
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const a = (await rl.question('  Ваш выбор (1 или 2): ')).trim();
   rl.close();
   return a === '2' ? 'batch' : 'now';
@@ -65,17 +91,37 @@ switch (cmd) {
 
   case 'import': {
     const file = flag('file', 'data/companies.csv');
-    const s = importCsv(db, file);
+    const forced = String(flag('as', '')).toLowerCase();
+    const s = importCsv(db, file, forced === 'people' || forced === 'companies' ? { kind: forced } : {});
+    setMeta(db, 'list_kind', s.list_kind);
     console.log(`\nИмпорт из ${file}`);
-    console.log(`  строк в файле:      ${s.total}`);
+
+    // Тип списка меняет весь дальнейший конвейер, поэтому говорим о нём первым делом
+    const st = s.list_stats;
+    if (s.list_kind === 'people') {
+      console.log(`\n  ЭТО СПИСОК ЛПР, а не список компаний (${s.list_reason}).`);
+      console.log(`    строк: ${st.rows}, из них с ФИО: ${st.withName}`);
+      console.log(`    разных должностей: ${st.distinctTitles}, первых лиц среди них: ${st.topShare}%`);
+      console.log(`    компаний, где больше одного человека: ${st.multiPersonDomains}`);
+      console.log('    Люди берутся из файла как есть — заново их не ищем и по должностям не фильтруем.');
+      console.log('    Если это всё-таки список компаний: node run.js import --as companies');
+    } else if (st.withName) {
+      console.log(`\n  Список компаний (${s.list_reason}).`);
+      console.log('    Если это на самом деле выгрузка ЛПР: node run.js import --as people');
+    }
+
+    console.log(`\n  строк в файле:      ${s.total}`);
     console.log(`  новых компаний:     ${s.imported}   ← только они пойдут в обработку`);
     console.log(`  уже были в базе:    ${s.already}   ← повторно не оплачиваются`);
     console.log(`  без сайта:          ${s.no_site}`);
-    console.log(`  дублей внутри файла:${s.duplicates}`);
+    if (s.list_kind === 'people') console.log(`  ещё людей в тех же компаниях: ${s.extra_people ?? 0}`);
+    else console.log(`  дублей внутри файла:${s.duplicates}`);
     console.log(`  ЛПР из импорта:     ${s.people_from_import}`);
     console.log(`\n  распознанные колонки:`);
+    const person = s.list_kind === 'people';
     const LBL = { brand: 'бренд', legal_name: 'юрлицо', name: '→ в поиск идёт', inn: 'ИНН',
-                  site: 'сайт', ceo_name: 'ФИО руковод.', ceo_title: 'должность', phones: 'телефоны', emails: 'почты' };
+                  site: 'сайт', ceo_name: person ? 'ФИО человека' : 'ФИО руковод.',
+                  ceo_title: 'должность', phones: 'телефоны', emails: 'почты' };
     for (const [k, v] of Object.entries(s.column_map)) console.log(`    ${(LBL[k] ?? k).padEnd(16)} ← "${v}"`);
     if (!s.column_map.brand) console.log('    (колонки с брендом нет — в поиск пойдёт юрлицо)');
     finalReport(db, { title: 'ИТОГИ ИМПОРТА' });
@@ -103,6 +149,16 @@ switch (cmd) {
 
   case 'qualify': {
     const only = flag('only', null);
+    // Список уже отобран вручную или выгружен по фильтру — тогда отбор не нужен,
+    // и платить за него незачем. Компании просто помечаются подходящими.
+    if (has('skip')) {
+      const r = db.prepare(`UPDATE companies SET icp_status='pass', icp_reason='квалификация пропущена по решению пользователя'
+                            WHERE icp_status='pending'`).run();
+      setMeta(db, 'qualify_skipped', 'true');
+      console.log(`\n  Отбор пропущен: ${r.changes} компаний помечены подходящими, ни одного платного вызова.`);
+      console.log('  Передумали — верните отбор: node run.js reset --stage qualify\n');
+      break;
+    }
     const client = makeClient();
     const n = db.prepare(`SELECT COUNT(*) n FROM companies WHERE fetch_status='ok' AND icp_status='pending'`).get().n;
     if (!n) { console.log('\n  Нечего квалифицировать — все обработаны.'); break; }
@@ -215,10 +271,25 @@ switch (cmd) {
   case 'emails': {
     const client = makeClient();
     const provs = activeProviders().map((p) => p.name);
-    console.log('\nПодбор почт...');
-    console.log(provs.length ? `  платные сервисы подключены: ${provs.join(', ')}`
-                             : '  платные сервисы не подключены — ищем только среди уже собранных почт');
-    const r = await findEmails(db, client, { onProgress: bar });
+    const source = String(flag('source', getMeta(db, 'email_sources', process.env.EMAIL_SOURCES ?? 'both'))).toLowerCase();
+    if (!['site', 'providers', 'both'].includes(source)) {
+      console.log('\n  --source принимает: site | providers | both\n');
+      console.log('    site      только почты со страниц сайтов — бесплатно, находит меньше');
+      console.log('    providers только платные сервисы — сайты для этого не нужны');
+      console.log('    both      сначала бесплатно, платно только за остаток (по умолчанию)\n');
+      break;
+    }
+    setMeta(db, 'email_sources', source);
+    const SRC = { site: 'только сайты (бесплатно)', providers: 'только платные сервисы',
+                  both: 'сайты + платные сервисы за остаток' };
+    console.log(`\nПодбор почт · источник: ${SRC[source]}`);
+    if (source !== 'site') {
+      console.log(provs.length ? `  платные сервисы подключены: ${provs.join(', ')}`
+                               : '  ⚠️  платные сервисы не подключены — платная часть пропустится');
+    }
+    const only = flag('only', null);
+    if (only) console.log(`  платная часть ограничена: не больше ${only} человек`);
+    const r = await findEmails(db, client, { source, limit: only ? Number(only) : undefined, onProgress: bar });
     console.log(`\n  найдено шаблонами (бесплатно): ${r.matched ?? 0}`);
     console.log(`  подобрано нейросетью:          ${r.byLlm ?? 0}`);
     console.log(`  куплено у провайдеров:         ${r.bought ?? 0}`);
@@ -236,23 +307,75 @@ switch (cmd) {
   }
 
   case 'all': {
-    const steps = [
-      ['import',  'загрузка списка'],
-      ['fetch',   'открытие сайтов'],
-      ['qualify', 'отбор по ICP'],
-      ['pages',   'догрузка страниц победителям'],
-      ['people',  'поиск ЛПР'],
-      ['emails',  'подбор и проверка почт'],
-      ['export',  'выгрузка таблиц'],
-    ];
-    console.log('\n  Полный прогон. Последовательность:');
-    steps.forEach(([c, d], i) => console.log(`    ${i + 1}. ${c.padEnd(9)} ${d}`));
+    const { spawnSync: sp0 } = await import('node:child_process');
+    // Импорт делаем сразу: пока не увидим файл, неизвестно даже, что за список.
+    if (sp0(process.execPath, ['run.js', 'import', ...args], { stdio: 'inherit' }).status !== 0) break;
+
+    const kind = getMeta(db, 'list_kind', 'companies');
+    let steps;
+
+    if (kind === 'people') {
+      console.log(`\n${'━'.repeat(64)}\n  У ВАС СПИСОК ЛПР — конвейер собирается под него\n${'━'.repeat(64)}`);
+      console.log('  Людей искать не нужно: они уже есть в файле. Осталось решить,');
+      console.log('  отбирать ли компании и откуда брать почты.');
+
+      const doQualify = await ask(
+        'Отбирать компании по критериям или в списке все подходящие?',
+        [{ value: false, label: 'все подходят — отбор не нужен',
+           hint: 'ни одного платного вызова, сразу переходим к почтам' },
+         { value: true,  label: 'отобрать по критериям из prompts/qualify.md',
+           hint: 'нужно открыть сайты и оценить каждую компанию, это платный этап' }]);
+
+      const source = await ask(
+        'Откуда искать почты?',
+        [{ value: 'both',      label: 'сайты + платные сервисы — максимальный результат',
+           hint: 'сначала бесплатно со страниц, платно только за тех, кто остался' },
+         { value: 'site',      label: 'только сайты — бесплатно',
+           hint: 'найдётся заметно меньше: на сайте есть не каждый сотрудник' },
+         { value: 'providers', label: 'только платные сервисы',
+           hint: 'сайты открывать не нужно, прогон будет быстрее' }]);
+
+      const mailboxes = await ask(
+        'Забирать ли с сайтов общие почты и почты отделов?',
+        [{ value: 'none',  label: 'нет, только именные почты ЛПР' },
+         { value: 'both',  label: 'да, и общие (info@), и отделов (marketing@)' },
+         { value: 'gen',   label: 'только общие (info@, office@)' },
+         { value: 'dept',  label: 'только отделов (marketing@, sales@)' }],
+        'Пригодятся, когда именная почта человека не нашлась.');
+
+      setMeta(db, 'email_sources', source);
+      setMeta(db, 'export_generic', String(mailboxes === 'both' || mailboxes === 'gen'));
+      setMeta(db, 'export_departments', String(mailboxes === 'both' || mailboxes === 'dept'));
+
+      // сайты нужны, только если с них что-то берут: почты людей или общие ящики
+      const needSites = source !== 'providers' || mailboxes !== 'none' || doQualify;
+      steps = [
+        ...(needSites ? [['fetch', 'открытие сайтов']] : []),
+        [doQualify ? 'qualify' : 'qualify --skip', doQualify ? 'отбор по ICP' : 'отбор пропускаем'],
+        ...(needSites ? [['pages', 'догрузка страниц — оттуда берутся почты']] : []),
+        ['emails', 'подбор и проверка почт'],
+        ['export', 'выгрузка таблиц'],
+      ];
+      console.log('\n  Поиск ЛПР пропускаем — они уже в файле.');
+    } else {
+      steps = [
+        ['fetch',   'открытие сайтов'],
+        ['qualify', 'отбор по ICP'],
+        ['pages',   'догрузка страниц победителям'],
+        ['people',  'поиск ЛПР'],
+        ['emails',  'подбор и проверка почт'],
+        ['export',  'выгрузка таблиц'],
+      ];
+    }
+
+    console.log('\n  Дальнейшая последовательность:');
+    steps.forEach(([c, d], i) => console.log(`    ${i + 1}. ${c.padEnd(15)} ${d}`));
     console.log('\n  Каждый этап можно запустить и отдельно — командой из списка.');
-    console.log('  Платные этапы (3, 5, 6) спросят подтверждение.\n');
+    console.log('  Платные этапы спросят подтверждение.\n');
     for (const [c] of steps) {
       console.log(`\n${'━'.repeat(64)}\n  ЭТАП: ${c}\n${'━'.repeat(64)}`);
       const { spawnSync } = await import('node:child_process');
-      const r = spawnSync(process.execPath, ['run.js', c], { stdio: 'inherit' });
+      const r = spawnSync(process.execPath, ['run.js', ...c.split(' ')], { stdio: 'inherit' });
       if (r.status !== 0) { console.log(`\n  Этап ${c} прервался. Продолжить: node run.js ${c}`); break; }
     }
     break;
@@ -302,11 +425,25 @@ switch (cmd) {
 
   case 'export': {
     const keepPersonal = (process.env.KEEP_PERSONAL_EMAILS ?? 'true') !== 'false';
-    const r = exportAll(db, { keepPersonal });
+    const onoff = (name) => {
+      const v = flag(name, null);
+      if (v === null) return undefined;
+      return v === true || /^(on|true|да|yes|1)$/i.test(String(v));
+    };
+    const generic = onoff('generic'), departments = onoff('departments');
+    if (generic !== undefined) setMeta(db, 'export_generic', String(generic));
+    if (departments !== undefined) setMeta(db, 'export_departments', String(departments));
+    const r = exportAll(db, { keepPersonal, generic, departments });
+    const third = r.perPerson ? 'out/3-ЛПР-без-личной-почты.csv' : 'out/3-общие-почты.csv';
     console.log(`
   out/1-компании.csv        ${r.companies} строк`);
-    console.log(`  out/2-ЛПР-с-почтами.csv   ${r.people} строк`);
-    console.log(`  out/3-общие-почты.csv     ${r.generic} строк  (с найденной общей почтой: ${r.withGeneric})`);
+    console.log(`  out/2-ЛПР-с-почтами.csv   ${r.people} строк   ← главная таблица`);
+    if (r.wantGeneric || r.wantDept) {
+      console.log(`  ${third.padEnd(25)} ${r.generic} строк  (с общей почтой или почтой отдела: ${r.withGeneric})`);
+    } else {
+      console.log('  третья таблица не создавалась: общие почты и почты отделов не запрашивались');
+      console.log('    забрать их: node run.js export --generic on --departments on');
+    }
     finalReport(db, { title: 'ИТОГИ ВЫГРУЗКИ' });
     break;
   }

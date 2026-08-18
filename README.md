@@ -185,8 +185,10 @@ node run.js titles --suggest
 
 ```
 node run.js import   [--file data/файл.csv]     загрузить список, убрать дубли
+node run.js import   --as people                своя выгрузка ЛПР, а не компаний
 node run.js fetch    [--only 20]                открыть сайты компаний
 node run.js qualify  [--only 20]                отобрать подходящие
+node run.js qualify  --skip                    отбор не нужен, все подходят
 node run.js collect                             забрать пакетный прогон
 node run.js titles [--suggest]                  должности: отчёт и чем дополнить
 node run.js reset --stage qualify               пересчитать отбор после правки критерия

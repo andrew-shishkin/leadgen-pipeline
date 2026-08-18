@@ -37,16 +37,49 @@ const COLUMN_ALIASES = {
               /коммерческ\w*\s*(?:назв|наимен)/i, /^trade\s*mark$/i],
   legal_name:[/^(?:ооо|оао|зао|пао|ао|ип)$/i, /юр\w*[\s.-]*(?:лиц|наимен|назв)/i,
               /legal\s*(?:name|entity)?/i, /полное\s*наимен/i,
-              /наименован/i, /^компан/i, /название/i, /^name$/i, /organization/i],
+              /наименован/i, /^компан/i, /название/i, /^company/i, /organization/i,
+              // «Name» одинаково похоже и на компанию, и на человека — решает
+              // содержимое колонки, см. разбор ниже
+              /^name$/i],
   inn:       [/инн/i, /^inn$/i, /tax/i],
   site:      [/сайт/i, /site/i, /website/i, /url/i, /домен/i],
-  ceo_name:  [/фио.*(руковод|директор)/i, /руководител/i, /директор/i, /ceo/i],
-  ceo_title: [/должность.*руковод/i, /должность/i],
+  ceo_name:  [/фио.*(руковод|директор)/i, /^фио$/i, /^full\s*name$/i, /контактное\s*лицо/i,
+              /руководител/i, /директор/i, /ceo/i, /^person/i, /^contact\s*name$/i],
+  ceo_title: [/должность.*руковод/i, /должность/i, /^title$/i, /job\s*title/i, /^position$/i, /^роль$/i],
   phones:    [/телефон/i, /phone/i],
   emails:    [/^все почты/i, /почт/i, /e-?mail/i],
 };
 
-export function detectColumns(sample) {
+/** Юрлицо, а не человек: кавычки и организационные формы. */
+const LEGAL_FORM = /(^|\W)(ооо|оао|зао|пао|ао|ип|нко|гк|тд|нпо|llc|ltd|inc|gmbh|corp|group|групп)(\W|$)|[«»"]/i;
+
+/** «Иван Петров», «Ivan Petrov», «Петров Иван Сергеевич». */
+function looksLikePersonName(v) {
+  const t = String(v ?? '').trim();
+  if (!t || t.length > 60 || /[0-9@/\\]/.test(t)) return false;
+  if (LEGAL_FORM.test(t)) return false;
+  const w = t.split(/\s+/);
+  if (w.length < 2 || w.length > 4) return false;
+  return w.every((x) => /^[A-ZА-ЯЁ][\p{L}'’.\-]*$/u.test(x));
+}
+
+const TITLE_HINT = /директор|руководител|начальник|глава|менеджер|специалист|инженер|маркетолог|дизайнер|founder|owner|head|chief|lead|manager|director|officer|president|^vp\b|ceo|cto|cmo|coo|designer|engineer/i;
+
+const looksLikeTitle = (v) => {
+  const t = String(v ?? '').trim();
+  return !!t && t.length <= 90 && TITLE_HINT.test(t);
+};
+
+/**
+ * Какая колонка что означает.
+ *
+ * Сначала по названию заголовка, потом — по содержимому. Второй проход нужен,
+ * потому что в выгрузках из баз колонки называются «Name» и «Title», и по
+ * названию не отличить компанию от человека: решают сами значения.
+ */
+export function detectColumns(input) {
+  const rows = Array.isArray(input) ? input : [input];
+  const sample = rows[0] ?? {};
   const cols = Object.keys(sample);
   const map = {};
   for (const [field, patterns] of Object.entries(COLUMN_ALIASES)) {
@@ -55,6 +88,36 @@ export function detectColumns(sample) {
       if (hit && !Object.values(map).includes(hit)) { map[field] = hit; break; }
     }
   }
+
+  const share = (col, fn) => {
+    const vals = rows.map((r) => String(r[col] ?? '').trim()).filter(Boolean);
+    if (vals.length < Math.min(3, rows.length)) return 0;
+    return vals.filter(fn).length / vals.length;
+  };
+  const best = (fn, min) => {
+    let pick = null, top = min;
+    for (const c of cols) {
+      if (Object.values(map).includes(c)) continue;
+      const v = share(c, fn);
+      if (v > top) { top = v; pick = c; }
+    }
+    return pick;
+  };
+
+  // «Name» разобрали как юрлицо, а внутри — люди: значит это колонка ФИО
+  if (map.legal_name && !map.ceo_name && share(map.legal_name, looksLikePersonName) >= 0.6
+      && (map.brand || map.inn)) {
+    map.ceo_name = map.legal_name;
+    delete map.legal_name;
+  }
+  if (!map.ceo_name)  { const c = best(looksLikePersonName, 0.6); if (c) map.ceo_name = c; }
+  if (!map.ceo_title) { const c = best(looksLikeTitle, 0.5);      if (c) map.ceo_title = c; }
+  // название компании так и не нашлось, а свободная текстовая колонка есть
+  if (!map.brand && !map.legal_name) {
+    const c = best((v) => String(v).trim().length > 2 && !looksLikePersonName(v) && !looksLikeTitle(v), 0.7);
+    if (c) map.legal_name = c;
+  }
+
   // рабочее название компании: бренд, если он есть, иначе юрлицо
   map.name = map.brand ?? map.legal_name;
   return map;
@@ -66,10 +129,53 @@ const pickName = (r, map) =>
 
 const splitList = (s) => (s ?? '').split(/[,;\n]/).map((x) => x.trim()).filter(Boolean);
 
-export function importCsv(db, file, { columns } = {}) {
+/** Должности верхнего уровня: в списке компаний обычно только они. */
+const TOP_TITLE = /генеральн|учредител|основател|владел|президент|founder|owner|^ceo$|^директор$|^руководитель$|^director$/i;
+
+/**
+ * Что нам дали — список компаний или сразу список ЛПР?
+ *
+ * Список компаний: одна строка на компанию, из людей — только первое лицо.
+ * Список ЛПР (выгрузка из LinkedIn или базы): много разных должностей
+ * и несколько человек на одну компанию.
+ *
+ * Разница принципиальная. При импорте списка компаний строки схлопываются
+ * по домену — для списка ЛПР это означало бы выбросить всех, кроме одного
+ * человека в каждой компании.
+ */
+export function detectListKind(rows, map) {
+  const titles = map.ceo_title ? rows.map((r) => (r[map.ceo_title] ?? '').trim()).filter(Boolean) : [];
+  const names  = map.ceo_name  ? rows.map((r) => (r[map.ceo_name]  ?? '').trim()).filter(Boolean) : [];
+  const distinct = new Set(titles.map((t) => t.toLowerCase())).size;
+  const top = titles.filter((t) => TOP_TITLE.test(t)).length;
+  const topShare = titles.length ? top / titles.length : 1;
+
+  // несколько РАЗНЫХ людей на одном домене — самый надёжный признак
+  const byDomain = new Map();
+  for (const r of rows) {
+    const site = normalizeUrl(r[map.site] ?? '');
+    const d = site ? domainOf(site) : null;
+    const who = map.ceo_name ? (r[map.ceo_name] ?? '').trim().toLowerCase() : '';
+    if (!d || !who) continue;
+    if (!byDomain.has(d)) byDomain.set(d, new Set());
+    byDomain.get(d).add(who);
+  }
+  const multi = [...byDomain.values()].filter((s) => s.size > 1).length;
+
+  const stats = { rows: rows.length, withName: names.length, titles: titles.length,
+                  distinctTitles: distinct, topShare: Math.round(topShare * 100), multiPersonDomains: multi };
+
+  if (!names.length) return { kind: 'companies', reason: 'колонки с ФИО нет', stats };
+  if (multi >= 2) return { kind: 'people', reason: `в ${multi} компаниях по несколько человек`, stats };
+  if (distinct >= 4 && topShare < 0.7)
+    return { kind: 'people', reason: `${distinct} разных должностей, первых лиц только ${Math.round(topShare * 100)}%`, stats };
+  return { kind: 'companies', reason: 'одна строка на компанию, должности однотипные', stats };
+}
+
+export function importCsv(db, file, { columns, kind } = {}) {
   const rows = parseCSV(fs.readFileSync(file, 'utf8'));
   if (!rows.length) throw new Error('Файл пустой');
-  const map = columns ?? detectColumns(rows[0]);
+  const map = columns ?? detectColumns(rows);
   if (!map.site && !map.name) throw new Error('Не нашёл ни колонки с сайтом, ни с названием компании');
   if (!map.name) throw new Error(
     'Не нашёл колонку с названием компании. Ожидаю что-то вроде «Наименование», ' +
@@ -87,27 +193,57 @@ export function importCsv(db, file, { columns } = {}) {
 
   // Отдельно считаем НОВЫЕ и УЖЕ ИЗВЕСТНЫЕ: при регулярной подгрузке по триггерам
   // именно это главная цифра — сколько компаний реально пойдёт в обработку.
+  const detected = detectListKind(rows, map);
+  const listKind = kind ?? detected.kind;
+
   const known = new Set(db.prepare(`SELECT domain FROM companies`).all().map((r) => r.domain));
-  const stat = { total: rows.length, imported: 0, already: 0, no_site: 0, duplicates: 0 };
-  const seen = new Set();
+  const stat = { total: rows.length, imported: 0, already: 0, no_site: 0, duplicates: 0,
+                 list_kind: listKind, list_reason: detected.reason, list_stats: detected.stats,
+                 list_detected: detected.kind };
+  const seen = new Map();
+  const personRows = [];
   for (const r of rows) {
     const site = normalizeUrl(r[map.site] ?? '');
     const domain = site ? domainOf(site) : null;
     if (!domain) { stat.no_site++; continue; }
-    if (seen.has(domain)) { stat.duplicates++; continue; }
-    seen.add(domain);
-    ins.run(domain, r[map.inn] ?? '', pickName(r, map), (map.legal_name && r[map.legal_name]) || '', site,
-      r[map.ceo_name] ?? '', r[map.ceo_title] ?? '',
-      j(splitList(r[map.phones])), j(splitList(r[map.emails])));
-    if (known.has(domain)) stat.already++; else stat.imported++;
+    const first = !seen.has(domain);
+    if (first) {
+      seen.set(domain, true);
+      ins.run(domain, r[map.inn] ?? '', pickName(r, map), (map.legal_name && r[map.legal_name]) || '', site,
+        r[map.ceo_name] ?? '', r[map.ceo_title] ?? '',
+        j(splitList(r[map.phones])), j(splitList(r[map.emails])));
+      if (known.has(domain)) stat.already++; else stat.imported++;
+    } else if (listKind === 'people') {
+      // строка не дубль компании, а ещё один человек в уже известной компании
+      stat.extra_people = (stat.extra_people ?? 0) + 1;
+    } else {
+      stat.duplicates++;
+      continue;
+    }
+    if (listKind === 'people') personRows.push({ domain, r });
   }
 
-  // ФИО директора из импорта — сразу в таблицу людей, это готовый контакт
-  const people = db.prepare(`
-    INSERT OR IGNORE INTO people (company_id, full_name, title, origin)
-    SELECT id, ceo_name, COALESCE(NULLIF(ceo_title,''),'Руководитель'), 'import'
-    FROM companies WHERE ceo_name IS NOT NULL AND TRIM(ceo_name) <> ''`).run();
-  stat.people_from_import = people.changes;
+  if (listKind === 'people') {
+    // Людей из файла берём как есть: их отобрал сам пользователь, и повторно
+    // фильтровать их по нашему titles.md — верный способ молча всё потерять.
+    const ins2 = db.prepare(`
+      INSERT OR IGNORE INTO people (company_id, full_name, title, origin, title_match, verified)
+      VALUES ((SELECT id FROM companies WHERE domain=?), ?, ?, 'import', 'pass', 'trusted')`);
+    let n = 0;
+    for (const { domain, r } of personRows) {
+      const fio = (r[map.ceo_name] ?? '').trim();
+      if (!fio) continue;
+      n += ins2.run(domain, fio, (r[map.ceo_title] ?? '').trim() || 'не указана').changes;
+    }
+    stat.people_from_import = n;
+  } else {
+    // ФИО директора из импорта — сразу в таблицу людей, это готовый контакт
+    const people = db.prepare(`
+      INSERT OR IGNORE INTO people (company_id, full_name, title, origin)
+      SELECT id, ceo_name, COALESCE(NULLIF(ceo_title,''),'Руководитель'), 'import'
+      FROM companies WHERE ceo_name IS NOT NULL AND TRIM(ceo_name) <> ''`).run();
+    stat.people_from_import = people.changes;
+  }
   stat.column_map = map;
   return stat;
 }
