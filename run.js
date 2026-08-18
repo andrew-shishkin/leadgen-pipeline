@@ -249,7 +249,12 @@ switch (cmd) {
       const seen = db.prepare(`SELECT SUM(usd) usd, COUNT(*) n FROM usage WHERE stage='people-search'`).get();
       const parse = seen?.n ? seen.usd / seen.n : 0.015;          // разбор страниц нейросетью
       const yandex = qn * RUB / USD_RUB;                           // запросы в Яндекс
-      const google = Number(process.env.BUILTIN_PRICE_USD ?? 0.045); // встроенный поиск, за компанию
+      // Встроенный поиск (Google) — это отдельные вызовы web_search ($0.01 за штуку)
+      // плюс токены модели, и то и другое уже попадает в usage.stage='search'.
+      // Раньше здесь стояла угаданная константа; теперь берём фактический расход
+      // на компанию, если он уже накоплен, и грубый ориентир — если нет.
+      const gSeen = db.prepare(`SELECT SUM(usd) usd, COUNT(*) n FROM usage WHERE stage='search' AND provider='anthropic'`).get();
+      const google = gSeen?.n ? gSeen.usd / gSeen.n : Number(process.env.BUILTIN_PRICE_USD ?? 0.1);
       const money2 = (u) => '$' + u.toFixed(3) + ' (' + Math.round(u * USD_RUB) + ' ₽)';
       const line = (v) => `${money2(v)} за строку · ${money2(v * pass)} за все ${pass}`;
 
