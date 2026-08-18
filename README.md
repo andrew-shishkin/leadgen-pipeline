@@ -189,6 +189,7 @@ node run.js fetch    [--only 20]                открыть сайты ком
 node run.js qualify  [--only 20]                отобрать подходящие
 node run.js collect                             забрать пакетный прогон
 node run.js titles [--suggest]                  должности: отчёт и чем дополнить
+node run.js reset --stage qualify               пересчитать отбор после правки критерия
 node run.js report                              где мы сейчас и сколько потрачено
 node run.js export                              выгрузить три таблицы
 ```

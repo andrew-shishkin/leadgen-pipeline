@@ -269,6 +269,32 @@ switch (cmd) {
     break;
   }
 
+  // Поменяли критерий отбора или список должностей — прошлые вердикты
+  // надо пересчитать. Скачанные страницы при этом сохраняются: качать
+  // сайты заново незачем, и это единственный бесплатный этап.
+  case 'reset': {
+    const stage = String(flag('stage', ''));
+    const R = {
+      qualify: [`UPDATE companies SET icp_status='pending', icp_json=NULL, icp_reason=NULL`,
+                'вердикты ICP сброшены — запустите node run.js qualify'],
+      people:  [`UPDATE companies SET people_status='pending', search_status=NULL; DELETE FROM people WHERE origin<>'import'`,
+                'найденные ЛПР удалены (кроме пришедших из файла) — запустите node run.js people'],
+      titles:  [`UPDATE people SET title_match='pending', verified='pending'`,
+                'отбор по должностям сброшен — запустите node run.js people'],
+    };
+    if (!R[stage]) {
+      console.log('\n  Укажите этап: --stage qualify | people | titles\n');
+      console.log('    qualify — пересчитать отбор компаний (после правки prompts/qualify.md)');
+      console.log('    people  — искать ЛПР заново (после правки prompts/titles.md)');
+      console.log('    titles  — только перепроверить должности у уже найденных людей\n');
+      console.log('  Скачанные страницы сайтов сохраняются в любом случае.\n');
+      break;
+    }
+    for (const sql of R[stage][0].split(';')) if (sql.trim()) db.exec(sql);
+    console.log(`\n  ${R[stage][1]}\n`);
+    break;
+  }
+
   case 'report': {
     finalReport(db, { title: 'ТЕКУЩЕЕ СОСТОЯНИЕ' });
     break;
@@ -297,6 +323,7 @@ switch (cmd) {
   node run.js browser                                 добрать сайты на JS (нужен Playwright)
   node run.js check                                   что настроено, чего не хватает
   node run.js titles [--suggest]                      список должностей: отчёт и чем дополнить
+  node run.js reset  --stage qualify|people|titles     пересчитать этап после правки промпта
   node run.js report                                  статус и расходы
   node run.js export                                  три CSV в out/
 
