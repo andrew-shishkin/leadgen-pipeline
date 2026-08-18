@@ -6,6 +6,8 @@
 //   yandex  — Yandex Cloud Search API. Выдача по РФ заметно полнее, но нужны
 //             аккаунт в Яндекс Облаке, API-ключ и folder id.
 //   none    — этап отключён.
+//   auto    — значение по умолчанию: Яндекс, если его ключи заполнены,
+//             иначе встроенный. Отдельно переключать ничего не нужно.
 //
 // Запросы собираются шаблоном в коде — нейросеть для этого не нужна.
 
@@ -13,7 +15,32 @@ import { withRetry } from './http.js';
 import { logUsage } from './db.js';
 import { getProvider } from './llm.js';
 
-export const searchProviderName = () => (process.env.SEARCH_PROVIDER || 'builtin').toLowerCase();
+/** Ключи Яндекса заполнены? Пустая строка и пробелы не считаются. */
+export const yandexKeysPresent = () =>
+  (process.env.YANDEX_API_KEY ?? '').trim().length > 5 &&
+  (process.env.YANDEX_FOLDER_ID ?? '').trim().length > 5;
+
+/** Какой поиск использовать.
+ *  Значение по умолчанию — auto: Яндекс, если его ключи заполнены, иначе
+ *  встроенный. Раньше по умолчанию стоял builtin, и оплаченный Яндекс молча
+ *  простаивал: ключи в .env есть, а запросы идут мимо них. */
+export function searchProviderName() {
+  const set = (process.env.SEARCH_PROVIDER ?? '').trim().toLowerCase();
+  if (set && set !== 'auto') return set;
+  return yandexKeysPresent() ? 'yandex' : 'builtin';
+}
+
+/** Ключи есть, но выбран другой поиск — сказать вслух, а не молчать. */
+export function searchProviderNote() {
+  const set = (process.env.SEARCH_PROVIDER ?? '').trim().toLowerCase();
+  if (!yandexKeysPresent()) return null;
+  if (set === 'builtin')
+    return 'ключи Яндекса заполнены, но в .env стоит SEARCH_PROVIDER=builtin — '
+         + 'поиск идёт встроенным, Яндекс не используется. Поставьте auto или yandex.';
+  if (set === 'none')
+    return 'ключи Яндекса заполнены, но поиск ЛПР выключен: SEARCH_PROVIDER=none.';
+  return null;
+}
 
 /** Склонение слова: именительный / родительный / творительный. */
 function wordForms(w) {

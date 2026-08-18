@@ -3,6 +3,7 @@
 
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { searchProviderName, yandexKeysPresent, searchProviderNote } from './search.js';
 
 const sha = (s) => crypto.createHash('sha256').update(s.replace(/\r\n/g, '\n').trim()).digest('hex').slice(0, 16);
 const has = (k) => (process.env[k] ?? '').trim().length > 5;
@@ -18,7 +19,7 @@ function promptState(file) {
 
 export function collectStatus() {
   const provider = (process.env.LLM_PROVIDER || 'anthropic').toLowerCase();
-  const searchProvider = (process.env.SEARCH_PROVIDER || 'builtin').toLowerCase();
+  const searchProvider = searchProviderName();
   const mailProviders = [
     ['prospeo', 'PROSPEO_API_KEY'], ['findymail', 'FINDYMAIL_API_KEY'],
     ['wiza', 'WIZA_API_KEY'], ['fullenrich', 'FULLENRICH_API_KEY'],
@@ -26,7 +27,7 @@ export function collectStatus() {
   return {
     llm: { provider, ok: has(provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY'),
            env: provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY' },
-    search: { provider: searchProvider, yandexOk: has('YANDEX_API_KEY') && has('YANDEX_FOLDER_ID') },
+    search: { provider: searchProvider, yandexOk: yandexKeysPresent(), note: searchProviderNote() },
     mail: mailProviders.map(([name, env]) => ({ name, env, ok: has(env) })),
     validate: { ok: has('ZEROBOUNCE_API_KEY') },
     prompts: [promptState('prompts/qualify.md'), promptState('prompts/titles.md')],
@@ -39,28 +40,34 @@ export function collectStatus() {
 export function printCheck(db) {
   const s = collectStatus();
   const L = [];
-  const todo = [];
+  const todo = [];   // о чём спросить пользователя
+  const done = [];   // что уже подключено — про это спрашивать нельзя
   L.push('', '─'.repeat(64), '  ПРОВЕРКА НАСТРОЙКИ', '─'.repeat(64), '');
 
   L.push('  НЕЙРОСЕТЬ — без неё не работает ничего');
-  if (s.llm.ok) L.push(`    ✅ ${s.llm.provider} — ключ на месте`);
+  if (s.llm.ok) { L.push(`    ✅ ${s.llm.provider} — ключ на месте`); done.push(`нейросеть ${s.llm.provider}`); }
   else { L.push(`    ❌ ${s.llm.provider}: не заполнен ${s.llm.env} в файле .env`); todo.push('ключ нейросети'); }
 
   L.push('', '  ПОИСК ЛПР В ИНТЕРНЕТЕ');
   if (s.search.provider === 'none') { L.push('    ⚪ выключен (SEARCH_PROVIDER=none)'); todo.push('поиск ЛПР выключен'); }
   else if (s.search.provider === 'yandex') {
-    if (s.search.yandexOk) L.push('    ✅ Яндекс — ключ и folder id на месте');
+    if (s.search.yandexOk) { L.push('    ✅ Яндекс — ключ и folder id на месте, поиск идёт через него'); done.push('Яндекс-поиск'); }
     else { L.push('    ❌ выбран yandex, но нет YANDEX_API_KEY / YANDEX_FOLDER_ID'); todo.push('ключи Яндекса'); }
   } else {
     L.push('    ✅ встроенный поиск — работает сразу, ключей не нужно');
-    L.push(`    ${s.search.yandexOk ? '💡' : '⚪'} Яндекс ${s.search.yandexOk ? 'настроен — можно переключиться: SEARCH_PROVIDER=yandex' : 'не подключён'}`);
-    if (!s.search.yandexOk) todo.push('Яндекс-поиск (по желанию)');
+    // «не подключён» пишем только когда ключей действительно нет: если они
+    // заполнены, а провайдер переключён вручную — это другая ситуация, о ней ниже
+    if (!s.search.yandexOk) {
+      L.push('    ⚪ Яндекс не подключён — по России находит заметно больше');
+      todo.push('Яндекс-поиск (по желанию)');
+    }
   }
+  if (s.search.note) L.push(`    ⚠️  ${s.search.note}`);
 
   const onMail = s.mail.filter((m) => m.ok).map((m) => m.name);
   const offMail = s.mail.filter((m) => !m.ok).map((m) => m.name);
   L.push('', '  ПОКУПКА ПОЧТ — необязательно');
-  if (onMail.length) L.push(`    ✅ подключены: ${onMail.join(', ')}`);
+  if (onMail.length) { L.push(`    ✅ подключены: ${onMail.join(', ')}`); done.push(`покупка почт (${onMail.join(', ')})`); }
   if (offMail.length) L.push(`    ⚪ без ключей: ${offMail.join(', ')}`);
   if (!onMail.length) {
     L.push('       Конвейер работает и так: почты собираются со страниц сайтов.');
@@ -68,7 +75,7 @@ export function printCheck(db) {
   }
 
   L.push('', '  ПРОВЕРКА ПОЧТ');
-  if (s.validate.ok) L.push('    ✅ ZeroBounce подключён');
+  if (s.validate.ok) { L.push('    ✅ ZeroBounce подключён'); done.push('проверка почт ZeroBounce'); }
   else { L.push('    ⚪ ZeroBounce не подключён — шаг пропускается'); todo.push('ZeroBounce (по желанию)'); }
 
   L.push('', '  НАСТРОЙКА ПОД ВАШ БИЗНЕС');
@@ -78,12 +85,15 @@ export function printCheck(db) {
     else if (p.untouched === true) {
       L.push(`    ⚠️  ${name} — стоит пример из шаблона, под вас не настроено`);
       todo.push(name === 'qualify.md' ? 'критерии отбора компаний' : 'список должностей');
-    } else if (p.untouched === false) L.push(`    ✅ ${name} — отредактирован`);
+    } else if (p.untouched === false) {
+      L.push(`    ✅ ${name} — отредактирован`);
+      done.push(name === 'qualify.md' ? 'критерии отбора' : 'список должностей');
+    }
     else L.push(`    ❔ ${name} — не с чем сверить`);
   }
 
   L.push('', '  ДАННЫЕ');
-  if (s.dataFiles.length) for (const f of s.dataFiles) L.push(`    • data/${f}`);
+  if (s.dataFiles.length) { for (const f of s.dataFiles) L.push(`    • data/${f}`); done.push('список компаний'); }
   else { L.push('    ⚪ в папке data/ нет ни одного CSV'); todo.push('список компаний'); }
 
   if (db) {
@@ -91,10 +101,20 @@ export function printCheck(db) {
     if (c) L.push('', `  В БАЗЕ УЖЕ ЕСТЬ ${c} компаний — прогон продолжится с места остановки`);
   }
 
+  // Ниже — готовый список для агента. Он существует, чтобы агент не предлагал
+  // подключить то, что уже подключено: спрашивать можно только про то, чего не хватает.
   L.push('', '─'.repeat(64));
-  if (todo.length) L.push('  НЕ ХВАТАЕТ: ' + todo.join(', '));
-  else L.push('  Всё настроено, можно запускать: node run.js all');
+  if (todo.length) {
+    L.push('  НЕ ХВАТАЕТ — спрашивать можно ТОЛЬКО про эти пункты:');
+    for (const t of todo) L.push(`    • ${t}`);
+  } else {
+    L.push('  Всё настроено, можно запускать: node run.js all');
+  }
+  if (done.length) {
+    L.push('', '  УЖЕ ПОДКЛЮЧЕНО — не предлагать настроить заново и не спрашивать про это:');
+    L.push('    ' + done.join(', '));
+  }
   L.push('─'.repeat(64), '');
   console.log(L.join('\n'));
-  return { status: s, todo };
+  return { status: s, todo, done };
 }
