@@ -330,8 +330,18 @@ async function builtinSearch(client, db, query, { limit = 10 } = {}) {
 }
 
 /** Единая точка входа. Возвращает [{url, title, snippet, date}]. */
+/**
+ * provider передаётся явно, а не читается из process.env на каждый вызов.
+ *
+ * Раньше движок выбирался глобальной переменной process.env.SEARCH_PROVIDER,
+ * и вызывающий код переключал её прямо перед вызовом. Это ломалось под
+ * конкурентной обработкой компаний (mapLimit с параллелизмом 3): пока один
+ * запрос ждёт ответа, другая компания успевала переключить ту же глобальную
+ * переменную на свой движок — и первый запрос уходил не туда. На прогоне
+ * 175 компаний это привело к тому, что почти все запросы вместо «Яндекс
+ * и Google» ушли через один движок вслепую. */
 export async function search(client, db, query, opts = {}) {
-  const provider = searchProviderName();
+  const provider = opts.provider ?? searchProviderName();
   if (provider === 'none') return [];
   if (provider === 'yandex') return (await yandexSearch(db, query, opts)).map((x) => ({ ...x, engine: 'yandex' }));
   if (provider === 'builtin') return (await builtinSearch(client, db, query, opts)).map((x) => ({ ...x, engine: 'builtin' }));

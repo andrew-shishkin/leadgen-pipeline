@@ -174,20 +174,20 @@ export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
     // странно её не искать. Раньше искались только TARGETS.
     const mode = searchProviderName();
     const engines = mode === 'both' ? ['yandex', 'builtin'] : [mode];
-    const prev = process.env.SEARCH_PROVIDER;
+    // provider передаётся явно на каждый вызов search() — компании обрабатываются
+    // параллельно (см. mapLimit ниже), и переключение через process.env здесь
+    // раньше ломалось: одна компания успевала перетереть движок другой.
     for (const eng of engines) {
-      process.env.SEARCH_PROVIDER = eng;
       // встроенный поиск сам ходит по выдаче — ему нужен один запрос на компанию,
       // а не список; Яндексу наоборот нужны точные запросы по одному
       const qs = eng === 'builtin'
         ? [{ kind: 'builtin', q: builtinQuery(c, [...titles.targets, ...titles.accept]) }]
         : buildQueries(c, [...titles.targets, ...titles.accept]);
       for (const q of qs) {
-        try { hits.push(...await search(client, db, q.q, { limit: 8 })); }
+        try { hits.push(...await search(client, db, q.q, { limit: 8, provider: eng })); }
         catch (e) { failed++; process.stderr.write(`\n  ! поиск(${eng}): ${e.message.slice(0, 160)}\n`); }
       }
     }
-    process.env.SEARCH_PROVIDER = prev;
     // какой движок отдал какой адрес — по этому потом считаем, кто сколько нашёл
     const engineOf = new Map();
     for (const h of hits) {
