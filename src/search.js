@@ -140,27 +140,54 @@ function packPhrases(prefix, phrases, maxChars) {
   return out.map((arr) => `${prefix} (${arr.join(' OR ')})`);
 }
 
-/** Запросы по компании. Их несколько: список должностей в один не помещается.
+/** Площадки, где реально пишут про сотрудников российских компаний.
  *
- *  Падежи не перебираем. Яндекс сам склоняет слова внутри кавычек — запросы
- *  "арт-директор" и "арт-директора" дают одну и ту же выдачу (проверено).
- *  Раньше три формы на каждую должность съедали две трети длины запроса. */
+ *  Проверено на живой выдаче: по запросу site:tadviser.ru "Корус Консалтинг"
+ *  находится страница компании, где перечислены директора по направлениям.
+ *  Список можно дополнить своими отраслевыми порталами. */
+const PEOPLE_SITES = (process.env.PEOPLE_SITES ??
+  'tadviser.ru,tenchat.ru,career.habr.com,setka.ru,sostav.ru,dprofile.ru,vc.ru,cnews.ru')
+  .split(',').map((x) => x.trim()).filter(Boolean);
+
+/** Сколько отдельных запросов по должностям делать на компанию. */
+const TITLE_QUERIES = Number(process.env.TITLE_QUERIES ?? 8);
+
+/** Запросы по компании.
+ *
+ *  Что изменилось и почему:
+ *
+ *  1. Убран site:домен-компании. Он возвращал страницы самой компании — на сайте
+ *     онлайн-школы по запросу "Head of Design" находятся карточки курсов, а не
+ *     сотрудники. Сайт компании и так скачивается этапом pages, людей оттуда
+ *     достаёт peopleFromPages, так что этот запрос был лишним и только съедал
+ *     место в тексте, который уходит в модель.
+ *
+ *  2. Должности спрашиваются по одной. Длинный OR возвращает столько же
+ *     результатов, но ранжирует хуже: по запросу «"КОРУС Консалтинг"
+ *     "Директор по маркетингу"» в выдаче есть профиль человека, по тому же
+ *     запросу в составе OR из тринадцати фраз — нет.
+ *
+ *  3. Добавлены площадки, где про людей пишут: отраслевые каталоги,
+ *     профессиональные сети, профильные СМИ.
+ *
+ *  LinkedIn сюда не входит намеренно: Яндекс его не отдаёт (проверено —
+ *  ноль результатов на всех вариантах запроса). */
 export function buildQueries(company, titles, { maxChars = MAX_QUERY_CHARS } = {}) {
-  const domain = company.domain;
   const short = (company.name ?? '')
     .replace(/^(ООО|АО|ПАО|ЗАО|ОАО|НПО|ТД)\s*/i, '').replace(/["«»]/g, '').trim();
   const list = [...new Set(titles.map((t) => String(t).trim()).filter(Boolean))];
   const out = [];
-  if (!list.length) return out;
+  if (!short) return out;
 
-  if (domain) for (const q of packPhrases(`site:${domain}`, list, maxChars)) out.push({ kind: 'site', q });
-  if (short)  for (const q of packPhrases(`"${short}"`,    list, maxChars)) out.push({ kind: 'company', q });
+  for (const t of list.slice(0, TITLE_QUERIES)) out.push({ kind: 'title', q: `"${short}" "${t}"` });
+
+  for (const site of PEOPLE_SITES) out.push({ kind: 'source', q: `site:${site} "${short}"` });
 
   const topics = topicWords(list);
-  if (short && topics.length) {
+  if (topics.length) {
     out.push({ kind: 'broad', q: `"${short}" (${topics.join(' OR ')}) (${ROLE_HEADS.join(' OR ')})` });
   }
-  return out;
+  return out.filter((x) => x.q.length <= maxChars);
 }
 
 // ─────────────────────────── Yandex Cloud Search API ───────────────────────────

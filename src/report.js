@@ -77,10 +77,30 @@ export function finalReport(db, { title = 'ИТОГИ ПРОГОНА' } = {}) {
   if (ppl.length) {
     L.push('');
     L.push('  ЛПР');
+    // Главная цифра — целевые, а не «всего найдено». В списке компаний почти
+    // все импортированные — генеральные директора, они по должности не проходят,
+    // и общее число создаёт впечатление, что людей много.
     const labels = { import: 'из исходного файла', site: 'с сайтов компаний', search: 'из поиска в Яндексе' };
-    for (const r of ppl) L.push(`    ${(labels[r.origin] ?? r.origin).padEnd(28)}${pad(r.n, 6)}`);
+    const target = db.prepare(`SELECT origin, COUNT(*) n FROM people WHERE title_match='pass' GROUP BY origin`).all();
+    const byOrigin = Object.fromEntries(target.map((r) => [r.origin, r.n]));
+    for (const r of ppl) {
+      const t = byOrigin[r.origin] ?? 0;
+      L.push(`    ${(labels[r.origin] ?? r.origin).padEnd(28)}${pad(r.n, 6)}   из них целевых: ${t}`);
+    }
+    const all = ppl.reduce((a, r) => a + r.n, 0);
+    const tgt = target.reduce((a, r) => a + r.n, 0);
+    L.push(`    ${'ЦЕЛЕВЫХ ВСЕГО'.padEnd(28)}${pad(tgt, 6)}   из ${all} найденных`);
+    L.push('       дальше по конвейеру идут только они — почты ищутся для целевых');
     const withMail = db.prepare(`SELECT COUNT(*) n FROM people WHERE email IS NOT NULL`).get().n;
-    if (withMail) L.push(`    ${'с найденной почтой'.padEnd(28)}${pad(withMail, 6)}`);
+    if (withMail) L.push(`    ${'с найденной почтой'.padEnd(28)}${pad(withMail, 6)}   ${tgt ? Math.round(100 * withMail / tgt) + '% от целевых' : ''}`);
+    // сколько компаний вообще не дали ни одного человека — это и есть узкое место
+    const zero = db.prepare(`SELECT COUNT(*) n FROM companies c WHERE c.icp_status='pass'
+      AND NOT EXISTS (SELECT 1 FROM people p WHERE p.company_id=c.id AND p.origin<>'import' AND p.title_match='pass')`).get().n;
+    const pass = db.prepare(`SELECT COUNT(*) n FROM companies WHERE icp_status='pass'`).get().n;
+    if (pass) {
+      L.push(`    ${'компаний без единого ЛПР'.padEnd(28)}${pad(zero, 6)}   из ${pass} подходящих (${Math.round(100 * zero / pass)}%)`);
+      if (zero / pass > 0.4) L.push('       больше 40% — расширьте список должностей или площадки поиска (PEOPLE_SITES в .env)');
+    }
     // фильтр по году — самая незаметная причина потерь, показываем её явно
     const byDate = db.prepare(
       `SELECT COUNT(*) n FROM people WHERE verified='false' AND verify_reason LIKE '%старше%'`).get().n;
