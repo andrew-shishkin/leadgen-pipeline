@@ -30,7 +30,14 @@ export function toCSV(rows, columns) {
 
 /** Гибкое сопоставление колонок: файлы у всех разные (Компас, Datanewton, Навигатор). */
 const COLUMN_ALIASES = {
-  name:      [/наименован/i, /^компан/i, /название/i, /^name$/i, /organization/i],
+  // Бренд и юрлицо — разные вещи. В интернете людей упоминают рядом
+  // с «Bang Bang Education», а не с «ООО Сила Знания», поэтому в поиск
+  // и в таблицы идёт бренд, а юрлицо сохраняется отдельным полем.
+  brand:     [/бренд/i, /brand/i, /торгов\w*\s*марк/i, /^тм$/i,
+              /коммерческ\w*\s*(?:назв|наимен)/i, /^trade\s*mark$/i],
+  legal_name:[/^(?:ооо|оао|зао|пао|ао|ип)$/i, /юр\w*[\s.-]*(?:лиц|наимен|назв)/i,
+              /legal\s*(?:name|entity)?/i, /полное\s*наимен/i,
+              /наименован/i, /^компан/i, /название/i, /^name$/i, /organization/i],
   inn:       [/инн/i, /^inn$/i, /tax/i],
   site:      [/сайт/i, /site/i, /website/i, /url/i, /домен/i],
   ceo_name:  [/фио.*(руковод|директор)/i, /руководител/i, /директор/i, /ceo/i],
@@ -45,11 +52,17 @@ export function detectColumns(sample) {
   for (const [field, patterns] of Object.entries(COLUMN_ALIASES)) {
     for (const p of patterns) {
       const hit = cols.find((c) => p.test(c) && (sample[c] ?? '').trim() !== '');
-      if (hit) { map[field] = hit; break; }
+      if (hit && !Object.values(map).includes(hit)) { map[field] = hit; break; }
     }
   }
+  // рабочее название компании: бренд, если он есть, иначе юрлицо
+  map.name = map.brand ?? map.legal_name;
   return map;
 }
+
+/** Строка может быть пустой в колонке бренда — тогда падаем на юрлицо. */
+const pickName = (r, map) =>
+  (map.brand && (r[map.brand] ?? '').trim()) || (map.legal_name && (r[map.legal_name] ?? '').trim()) || '';
 
 const splitList = (s) => (s ?? '').split(/[,;\n]/).map((x) => x.trim()).filter(Boolean);
 
@@ -57,13 +70,18 @@ export function importCsv(db, file, { columns } = {}) {
   const rows = parseCSV(fs.readFileSync(file, 'utf8'));
   if (!rows.length) throw new Error('Файл пустой');
   const map = columns ?? detectColumns(rows[0]);
-  if (!map.site && !map.name) throw new Error('Не нашёл ни колонки с сайтом, ни с названием');
+  if (!map.site && !map.name) throw new Error('Не нашёл ни колонки с сайтом, ни с названием компании');
+  if (!map.name) throw new Error(
+    'Не нашёл колонку с названием компании. Ожидаю что-то вроде «Наименование», ' +
+    '«Компания», «Бренд», «Brand», «ООО». Колонки в файле: ' + Object.keys(rows[0]).join(', '));
 
   const ins = db.prepare(`
-    INSERT INTO companies (domain, inn, name, site, ceo_name, ceo_title, phones, emails_import)
-    VALUES (?,?,?,?,?,?,?,?)
+    INSERT INTO companies (domain, inn, name, legal_name, site, ceo_name, ceo_title, phones, emails_import)
+    VALUES (?,?,?,?,?,?,?,?,?)
     ON CONFLICT(domain) DO UPDATE SET
       inn           = COALESCE(NULLIF(excluded.inn,''), companies.inn),
+      name          = COALESCE(NULLIF(excluded.name,''), companies.name),
+      legal_name    = COALESCE(NULLIF(excluded.legal_name,''), companies.legal_name),
       ceo_name      = COALESCE(NULLIF(excluded.ceo_name,''), companies.ceo_name),
       emails_import = excluded.emails_import`);
 
@@ -78,7 +96,7 @@ export function importCsv(db, file, { columns } = {}) {
     if (!domain) { stat.no_site++; continue; }
     if (seen.has(domain)) { stat.duplicates++; continue; }
     seen.add(domain);
-    ins.run(domain, r[map.inn] ?? '', r[map.name] ?? '', site,
+    ins.run(domain, r[map.inn] ?? '', pickName(r, map), (map.legal_name && r[map.legal_name]) || '', site,
       r[map.ceo_name] ?? '', r[map.ceo_title] ?? '',
       j(splitList(r[map.phones])), j(splitList(r[map.emails])));
     if (known.has(domain)) stat.already++; else stat.imported++;

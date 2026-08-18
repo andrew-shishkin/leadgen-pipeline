@@ -15,11 +15,21 @@ import { loadPrompt } from './stages.js';
 const fill = (t, v) => t.replace(/\{\{(\w+)\}\}/g, (_, k) => v[k] ?? '');
 const cheap = () => process.env.CHEAP_MODEL || (modelName().startsWith('claude') ? 'claude-haiku-4-5' : modelName());
 
-/** Справочник должностей из prompts/titles.md */
+/** Справочник должностей из prompts/titles.md.
+ *  Списки люди пишут по-разному: голыми строками, через дефис, звёздочкой,
+ *  нумерацией. Раньше строки с дефисом молча выбрасывались, и из десяти
+ *  должностей читались две — а поисковые запросы строятся именно отсюда. */
 export function loadTitles(file = 'prompts/titles.md') {
   const md = fs.readFileSync(file, 'utf8');
+  const clean = (l) => l
+    .replace(/[\u2010-\u2015\u2212]/g, '-')   // неразрывный дефис и тире → обычный дефис
+    .replace(/^\s*(?:[-*•–—]|\d+[.)])\s+/, '') // маркер списка
+    .replace(/^\s*\[[ xX]?\]\s*/, '')          // чекбокс
+    .replace(/[`*_]/g, '')                      // markdown-разметка
+    .trim();
   const sect = (n) => (md.split('## ' + n)[1] ?? '').split('\n##')[0]
-    .split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#') && !l.startsWith('>') && !/^[А-ЯЁ].*:$/.test(l) && !l.startsWith('-'));
+    .split('\n').map(clean)
+    .filter((l) => l && !l.startsWith('#') && !l.startsWith('>') && !/^[А-ЯЁ].*:$/.test(l));
   return { targets: sect('TARGETS'), accept: sect('ALSO_ACCEPT'), reject: sect('REJECT') };
 }
 

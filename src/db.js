@@ -105,6 +105,7 @@ function migrate(db) {
   const cols = (t) => new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((r) => r.name));
   const add = (t, name, decl) => { if (!cols(t).has(name)) db.exec(`ALTER TABLE ${t} ADD COLUMN ${name} ${decl}`); };
   add('companies', 'search_status', 'TEXT');
+  add('companies', 'legal_name', 'TEXT');
   add('people', 'name_nominative', 'TEXT');
   add('people', 'name_dative', 'TEXT');
 }

@@ -13,6 +13,7 @@ import { browserAvailable, installHint, closeBrowser } from './src/browser.js';
 import { searchProviderName } from './src/search.js';
 import { activeProviders } from './src/enrich.js';
 import { exportAll } from './src/export.js';
+import { printCheck } from './src/check.js';
 
 // .env без зависимостей
 if (fs.existsSync('.env')) {
@@ -72,7 +73,10 @@ switch (cmd) {
     console.log(`  дублей внутри файла:${s.duplicates}`);
     console.log(`  ЛПР из импорта:     ${s.people_from_import}`);
     console.log(`\n  распознанные колонки:`);
-    for (const [k, v] of Object.entries(s.column_map)) console.log(`    ${k.padEnd(10)} ← "${v}"`);
+    const LBL = { brand: 'бренд', legal_name: 'юрлицо', name: '→ в поиск идёт', inn: 'ИНН',
+                  site: 'сайт', ceo_name: 'ФИО руковод.', ceo_title: 'должность', phones: 'телефоны', emails: 'почты' };
+    for (const [k, v] of Object.entries(s.column_map)) console.log(`    ${(LBL[k] ?? k).padEnd(16)} ← "${v}"`);
+    if (!s.column_map.brand) console.log('    (колонки с брендом нет — в поиск пойдёт юрлицо)');
     finalReport(db, { title: 'ИТОГИ ИМПОРТА' });
     break;
   }
@@ -235,6 +239,11 @@ switch (cmd) {
     break;
   }
 
+  case 'check': {
+    printCheck(db);
+    break;
+  }
+
   case 'report': {
     finalReport(db, { title: 'ТЕКУЩЕЕ СОСТОЯНИЕ' });
     break;
@@ -261,6 +270,7 @@ switch (cmd) {
   node run.js people                                  найти ЛПР: сайт + поиск + проверка
   node run.js emails                                  подобрать, купить и проверить почты
   node run.js browser                                 добрать сайты на JS (нужен Playwright)
+  node run.js check                                   что настроено, чего не хватает
   node run.js report                                  статус и расходы
   node run.js export                                  три CSV в out/
 

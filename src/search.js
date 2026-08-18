@@ -26,10 +26,29 @@ function wordForms(w) {
   return [w, w, w];
 }
 
+/** Первая часть составного слова, которая не склоняется:
+ *  «арт-директора», а не «арта-директора». В отличие от «инженера-технолога»,
+ *  где обе части — полноценные существительные и склоняются обе. */
+const INDECLINABLE_PREFIX = new Set([
+  'арт', 'веб', 'интернет', 'медиа', 'бизнес', 'топ', 'бренд', 'пиар', 'гейм',
+  'ивент', 'продакт', 'проджект', 'аккаунт', 'контент', 'тимлид', 'экс', 'вице',
+  'пресс', 'смм', 'сео', 'ит', 'хр', 'бэк', 'фронт', 'фулл', 'дата', 'скрам',
+]);
+
+const isIndeclinable = (w) =>
+  INDECLINABLE_PREFIX.has(w.toLowerCase()) || /^[a-z]+$/i.test(w) || w.length <= 3;
+
 /** «главный инженер» → «главного инженера», «главным инженером». */
 function caseForms(title) {
   const words = title.trim().split(/\s+/);
-  const per = words.map((w) => w.split('-').map(wordForms));
+  const per = words.map((w) => {
+    const parts = w.split('-');
+    return parts.map((part, i) => {
+      // в составном слове первые части часто неизменяемы, последняя склоняется
+      const last = i === parts.length - 1;
+      return (!last && isIndeclinable(part)) ? [part, part, part] : wordForms(part);
+    });
+  });
   const out = new Set();
   for (let i = 0; i < 3; i++) {
     out.add(per.map((parts) => parts.map((f) => f[i]).join('-')).join(' '));

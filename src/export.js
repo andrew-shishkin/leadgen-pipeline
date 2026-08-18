@@ -13,6 +13,7 @@ const allEmails = (c) => [...new Set([...list(c.emails_import), ...list(c.emails
 /** Поля компании, которые дублируются в каждую строку ЛПР и generic-таблицы. */
 const companyFields = (c, d) => ({
   'Компания': c.name,
+  'Юрлицо': c.legal_name ?? '',
   'ИНН': c.inn,
   'Сайт': c.site,
   'Домен': c.domain,
@@ -36,7 +37,7 @@ export function exportAll(db, { dir = 'out', keepPersonal = true } = {}) {
   const t1 = companies.map((c) => {
     const d = unj(c.icp_json) ?? {};
     return {
-      'Компания': c.name, 'ИНН': c.inn, 'Сайт': c.site, 'Домен': c.domain,
+      'Компания': c.name, 'Юрлицо': c.legal_name ?? '', 'ИНН': c.inn, 'Сайт': c.site, 'Домен': c.domain,
       'Подходит под ICP': { pass: 'да', fail: 'нет', unclear: 'под вопросом',
                             error: 'ошибка', pending: 'не проверяли' }[c.icp_status] ?? c.icp_status,
       'Производитель': { yes: 'да', no: 'нет', unknown: 'непонятно' }[d.is_manufacturer] ?? '',
