@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import { loadTitles } from './stages-people.js';
 import { buildQueries, topicWords, searchProviderName } from './search.js';
 import { askJson } from './llm.js';
+import { matchTitles } from './stages-people.js';
 
 const SUGGEST_SCHEMA = {
   type: 'object',
@@ -129,4 +130,32 @@ export async function suggestTitles(db, client, { model } = {}) {
          '─'.repeat(64), '');
   console.log(L.join('\n'));
   return fresh;
+}
+
+
+/** Какие должности лежат в загруженном файле — до всякой фильтрации. */
+export function importedTitles(db, limit = 40) {
+  return db.prepare(`
+    SELECT title, COUNT(*) n FROM people
+    WHERE origin='import' AND TRIM(COALESCE(title,'')) <> ''
+    GROUP BY LOWER(TRIM(title)) ORDER BY n DESC LIMIT ?`).all(limit);
+}
+
+/**
+ * Отфильтровать уже загруженных людей по prompts/titles.md.
+ *
+ * Нужно, когда выгрузка сделана широким запросом и в ней есть лишние роли.
+ * Запускается только по явной просьбе: людей отбирал пользователь, и молча
+ * выбрасывать их нельзя.
+ */
+export async function filterImported(db, client, { model } = {}) {
+  const before = db.prepare(`SELECT COUNT(*) n FROM people WHERE origin='import'`).get().n;
+  db.prepare(`UPDATE people SET title_match='pending' WHERE origin='import'`).run();
+  const stat = await matchTitles(db, client, { model });
+  const kept = db.prepare(`SELECT COUNT(*) n FROM people WHERE origin='import' AND title_match='pass'`).get().n;
+  const cut = db.prepare(`
+    SELECT title, COUNT(*) n FROM people
+    WHERE origin='import' AND title_match='fail' AND TRIM(COALESCE(title,'')) <> ''
+    GROUP BY LOWER(TRIM(title)) ORDER BY n DESC LIMIT 20`).all();
+  return { before, kept, dropped: before - kept, unique: stat.unique ?? 0, cut };
 }

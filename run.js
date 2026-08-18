@@ -14,8 +14,8 @@ import { browserAvailable, installHint, closeBrowser } from './src/browser.js';
 import { searchProviderName, buildQueries } from './src/search.js';
 import { activeProviders } from './src/enrich.js';
 import { exportAll } from './src/export.js';
-import { printCheck } from './src/check.js';
-import { titlesReport, suggestTitles } from './src/titles.js';
+import { printCheck, collectStatus } from './src/check.js';
+import { titlesReport, suggestTitles, importedTitles, filterImported } from './src/titles.js';
 
 // .env без зависимостей
 if (fs.existsSync('.env')) {
@@ -288,7 +288,12 @@ switch (cmd) {
                                : '  ⚠️  платные сервисы не подключены — платная часть пропустится');
     }
     const only = flag('only', null);
-    if (only) console.log(`  платная часть ограничена: не больше ${only} человек`);
+    if (only) {
+      console.log(`  платная часть ограничена: не больше ${only} человек`);
+      console.log('  Это проверка, что интеграция работает. Судить по такой выборке,');
+      console.log('  много ли найдётся на всём списке, нельзя — и не нужно: запрос');
+      console.log('  без результата кредит обычно не списывает.');
+    }
     const r = await findEmails(db, client, { source, limit: only ? Number(only) : undefined, onProgress: bar });
     console.log(`\n  найдено шаблонами (бесплатно): ${r.matched ?? 0}`);
     console.log(`  подобрано нейросетью:          ${r.byLlm ?? 0}`);
@@ -318,6 +323,37 @@ switch (cmd) {
       console.log(`\n${'━'.repeat(64)}\n  У ВАС СПИСОК ЛПР — конвейер собирается под него\n${'━'.repeat(64)}`);
       console.log('  Людей искать не нужно: они уже есть в файле. Осталось решить,');
       console.log('  отбирать ли компании и откуда брать почты.');
+
+      // Прежде чем что-то спрашивать — показать, что настроено и что в файле.
+      // Без этого вопрос «фильтровать ли должности» задаётся вслепую.
+      const st = collectStatus();
+      const tt = loadTitles();
+      const tpl = (f) => st.prompts.find((x) => x.file === f)?.untouched === true;
+      console.log('\n  ЧТО СЕЙЧАС НАСТРОЕНО ПОД ВАС');
+      console.log(`    критерии отбора (prompts/qualify.md): ${tpl('prompts/qualify.md') ? '⚠️  пример из шаблона, под вас не настроено' : 'отредактированы'}`);
+      console.log(`    должности (prompts/titles.md): ${tt.targets.length} целевых + ${tt.accept.length} смежных` +
+                  `${tpl('prompts/titles.md') ? '  ⚠️  пример из шаблона' : ''}`);
+
+      const inFile = importedTitles(db, 15);
+      const totalPeople = db.prepare(`SELECT COUNT(*) n FROM people WHERE origin='import'`).get().n;
+      if (inFile.length) {
+        console.log(`\n  ДОЛЖНОСТИ В ВАШЕМ ФАЙЛЕ (${totalPeople} человек, показаны частые)`);
+        for (const r of inFile) console.log(`    ${String(r.n).padStart(4)}  ${r.title}`);
+      }
+
+      const doFilter = await ask(
+        'Должности в файле уже почищены под ваш ICP?',
+        [{ value: false, label: 'да, берём всех из файла',
+           hint: 'ничего не отсекаем — так и задумано, если выгрузка делалась по фильтру' },
+         { value: true,  label: 'нет, отфильтровать по prompts/titles.md',
+           hint: 'нейросеть сверит каждую формулировку со списком целевых должностей' }],
+        'Посмотрите на список выше: если там есть лишние роли — их стоит отсечь.');
+
+      if (doFilter && tpl('prompts/titles.md')) {
+        console.log('\n  ⚠️  Внимание: prompts/titles.md — это пример из шаблона, под вас он не настроен.');
+        console.log('      Фильтрация по нему выбросит почти весь ваш список.');
+        console.log('      Сначала настройте должности: node run.js titles --suggest\n');
+      }
 
       const doQualify = await ask(
         'Отбирать компании по критериям или в списке все подходящие?',
@@ -350,6 +386,7 @@ switch (cmd) {
       // сайты нужны, только если с них что-то берут: почты людей или общие ящики
       const needSites = source !== 'providers' || mailboxes !== 'none' || doQualify;
       steps = [
+        ...(doFilter ? [['titles --filter', 'отсев должностей, не попадающих в ICP']] : []),
         ...(needSites ? [['fetch', 'открытие сайтов']] : []),
         [doQualify ? 'qualify' : 'qualify --skip', doQualify ? 'отбор по ICP' : 'отбор пропускаем'],
         ...(needSites ? [['pages', 'догрузка страниц — оттуда берутся почты']] : []),
@@ -387,6 +424,22 @@ switch (cmd) {
   }
 
   case 'titles': {
+    if (has('filter')) {
+      const n = db.prepare(`SELECT COUNT(*) n FROM people WHERE origin='import'`).get().n;
+      if (!n) { console.log('\n  В базе нет людей из импорта — фильтровать нечего.\n'); break; }
+      const t = loadTitles();
+      console.log(`\nФильтрую ${n} человек из файла по prompts/titles.md`);
+      console.log(`  целевых должностей: ${t.targets.length}, также подходят: ${t.accept.length}, отсекаем: ${t.reject.length}`);
+      const r = await filterImported(db, makeClient(), {});
+      console.log(`\n  осталось:  ${r.kept}`);
+      console.log(`  отсеяно:   ${r.dropped}`);
+      if (r.cut.length) {
+        console.log('\n  что отсеклось:');
+        for (const c of r.cut) console.log(`    ${String(c.n).padStart(4)}  ${c.title}`);
+      }
+      console.log('\n  Отсекли лишнего — верните всех: node run.js reset --stage titles-import\n');
+      break;
+    }
     titlesReport(db);
     if (has('suggest')) await suggestTitles(db, makeClient(), { model: MODEL });
     break;
@@ -404,12 +457,15 @@ switch (cmd) {
                 'найденные ЛПР удалены (кроме пришедших из файла) — запустите node run.js people'],
       titles:  [`UPDATE people SET title_match='pending', verified='pending'`,
                 'отбор по должностям сброшен — запустите node run.js people'],
+      'titles-import': [`UPDATE people SET title_match='pass' WHERE origin='import'`,
+                'все люди из файла снова считаются подходящими'],
     };
     if (!R[stage]) {
-      console.log('\n  Укажите этап: --stage qualify | people | titles\n');
+      console.log('\n  Укажите этап: --stage qualify | people | titles | titles-import\n');
       console.log('    qualify — пересчитать отбор компаний (после правки prompts/qualify.md)');
       console.log('    people  — искать ЛПР заново (после правки prompts/titles.md)');
-      console.log('    titles  — только перепроверить должности у уже найденных людей\n');
+      console.log('    titles  — только перепроверить должности у уже найденных людей');
+      console.log('    titles-import — вернуть всех людей из загруженного файла\n');
       console.log('  Скачанные страницы сайтов сохраняются в любом случае.\n');
       break;
     }
