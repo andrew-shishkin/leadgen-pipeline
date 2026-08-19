@@ -69,6 +69,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  *  отчёту это выглядело так, будто он ничего не находит. */
 const POLL_SECONDS = Number(process.env.ENRICH_POLL_SECONDS ?? 180);
 
+/** Сколько написаний имени пробовать у медленных сервисов. Полный перебор
+ *  оставляем быстрым: у них вызов занимает секунды, а не минуту. */
+const SLOW_VARIANTS = Number(process.env.ENRICH_NAME_VARIANTS_SLOW ?? 2);
+
 /** Возвращается, когда сервис не ответил за отведённое время. Это НЕ «не
  *  найдено»: такой случай надо показать пользователю отдельно, иначе
  *  медленный сервис молча выглядит бесполезным. */
@@ -146,8 +150,14 @@ const PROVIDERS = [
     },
   },
   {
-    // асинхронный: возвращает enrichment_id, результат забирается опросом
-    name: 'fullenrich', env: 'FULLENRICH_API_KEY',
+    // асинхронный: возвращает enrichment_id, результат забирается опросом.
+    //
+    // Помечен медленным: один вызов занимает около минуты, и полный перебор
+    // написаний превращается в четыре минуты на человека — замер на живом
+    // прогоне дал 182-267 секунд. На большой базе это часы ради нескольких
+    // дополнительных находок, поэтому здесь пробуем только основное
+    // написание и одно запасное, а весь перебор оставляем быстрым сервисам.
+    name: 'fullenrich', env: 'FULLENRICH_API_KEY', slow: true,
     async find({ first, last, domain }, key) {
       const auth = { Authorization: `Bearer ${key}` };
       const started = await jsonPost('https://app.fullenrich.com/api/v2/contact/enrich/bulk', auth, {
@@ -229,7 +239,10 @@ export async function findEmail(db, person) {
     if (f && f.count >= FAIL_LIMIT) { tried.push(`${p.name}(отключён)`); continue; }
     const key = process.env[p.env];
 
-    for (const [i, v] of queue.entries()) {
+    // у медленных сервисов перебор написаний обходится слишком дорого
+    // по времени — берём только первые SLOW_VARIANTS
+    const list = p.slow ? queue.slice(0, Math.max(1, SLOW_VARIANTS)) : queue;
+    for (const [i, v] of list.entries()) {
       try {
         const email = await withRetry(() => p.find(v, key), { tries: 3 });
         note(db, p.name, email ? 'found' : 'not_found');
