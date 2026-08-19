@@ -7,8 +7,8 @@ import { fetchPage, mapLimit } from './http.js';
 import { fetchWithBrowser, browserAvailable } from './browser.js';
 import { htmlToText, extractEmails, cutPeopleFragments } from './extract.js';
 import { askJson, modelName, modelFor } from './llm.js';
-import { search, buildQueries, searchProviderName, builtinQueries } from './search.js';
-import { findEmail, validateEmail, activeProviders } from './enrich.js';
+import { search, buildQueries, searchProviderName, builtinQueries, builtinAvailable } from './search.js';
+import { findEmail, validateEmail, activeProviders, guessEmail } from './enrich.js';
 import { matchEmailToPerson, parseFio, looksPersonal } from './emails.js';
 import { loadPrompt } from './stages.js';
 
@@ -197,6 +197,13 @@ function pickUrls(hits, { limit, skipDomain }) {
 
 export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
   if (searchProviderName() === 'none') return { skipped: true };
+  // Сказать один раз в начале, а не падать на каждой компании по очереди.
+  if (['both', 'builtin'].includes(searchProviderName()) && !builtinAvailable()) {
+    process.stdout.write(
+      '\n  Встроенный поиск (Google) доступен только на Anthropic, а сейчас выбран OpenAI.\n'
+    + '  Ищем через Яндекс. Чтобы вернуть Google, поставьте LLM_PROVIDER=anthropic в .env.\n');
+    if (searchProviderName() === 'builtin') return { skipped: true, reason: 'builtin недоступен на OpenAI' };
+  }
   const { system, user: tpl } = loadPrompt('prompts/people.md');
   const titles = loadTitles();
   const titleList = [...titles.targets, ...titles.accept].join(', ');
@@ -215,7 +222,8 @@ export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
     // в поиск идут и TARGETS, и ALSO_ACCEPT: раз формулировка нам подходит,
     // странно её не искать. Раньше искались только TARGETS.
     const mode = searchProviderName();
-    const engines = mode === 'both' ? ['yandex', 'builtin'] : [mode];
+    const engines = (mode === 'both' ? ['yandex', 'builtin'] : [mode])
+      .filter((e) => e !== 'builtin' || builtinAvailable());
     // provider передаётся явно на каждый вызов search() — компании обрабатываются
     // параллельно (см. mapLimit ниже), и переключение через process.env здесь
     // раньше ломалось: одна компания успевала перетереть движок другой.
@@ -454,7 +462,7 @@ const MATCH_SCHEMA = {
  *   providers — только платные сервисы (сайты не нужны)
  *   both      — сначала бесплатно, платно только за остаток (по умолчанию)
  */
-export async function findEmails(db, client, { model, buy = true, source, limit, onProgress } = {}) {
+export async function findEmails(db, client, { model, buy = true, source, limit, guess = false, onProgress } = {}) {
   const src = (source ?? process.env.EMAIL_SOURCES ?? 'both').toLowerCase();
   const useSite = src !== 'providers';
   const usePaid = buy && src !== 'site';
@@ -536,6 +544,22 @@ export async function findEmails(db, client, { model, buy = true, source, limit,
       if (r.email && (keep || !/(mail|ya|yandex|bk|inbox|list|rambler|gmail)\./.test(r.email.split('@')[1] ?? ''))) {
         setEmail.run(r.email, r.source, p.id); stat.bought++;
       } else stat.notFound++;
+    }, onProgress);
+  }
+
+  // 9.4 подбор по шаблону — только если пользователь на него согласился
+  if (guess) {
+    const rest = db.prepare(`
+      SELECT p.id, p.full_name, c.domain FROM people p JOIN companies c ON c.id=p.company_id
+      WHERE c.icp_status='pass' AND p.email IS NULL AND p.title_match='pass'
+        AND p.verified IN ('true','unknown','trusted') AND c.domain IS NOT NULL`).all();
+    stat.guessQueue = rest.length;
+    stat.guessed = 0; stat.catchAll = 0;
+    if (rest.length) process.stdout.write(`\n  подбор по шаблону: ${rest.length} человек, каждая проверка — кредит валидатора\n`);
+    await mapLimit(rest, 3, async (p) => {
+      const g = await guessEmail(db, { full: p.full_name, domain: p.domain });
+      if (g.email) { setEmail.run(g.email, 'подобрана по шаблону', p.id); stat.guessed++; }
+      else if (g.catchAll) stat.catchAll++;
     }, onProgress);
   }
   return stat;

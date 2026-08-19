@@ -6,6 +6,10 @@ import { costReport, unj } from './db.js';
 const money = (u) => '$' + (u < 1 ? u.toFixed(4) : u.toFixed(2));
 const pct = (n, t) => (t ? Math.round((100 * n) / t) + '%' : '—');
 const pad = (s, n) => String(s).padStart(n);
+const plural = (n, one, few, many) => {
+  const a = n % 100, b = n % 10;
+  return a > 10 && a < 20 ? many : b === 1 ? one : b >= 2 && b <= 4 ? few : many;
+};
 
 const ERROR_LABELS = {
   ENOTFOUND: 'домен не существует — компании больше нет',
@@ -117,6 +121,44 @@ export function finalReport(db, { title = 'ИТОГИ ПРОГОНА' } = {}) {
     if (byDate) {
       L.push(`    ${'отсеяно по дате публикации'.padEnd(28)}${pad(byDate, 6)}`);
       L.push(`       если это много — сдвиньте FRESH_SINCE_YEAR в .env (сейчас ${process.env.FRESH_SINCE_YEAR || 2022})`);
+    }
+  }
+
+  // Разбивка по сервисам поиска почт. Нужна, чтобы молчаливая поломка одного
+  // провайдера была видна: FullEnrich отвечал за ~70 секунд, а его ждали 35,
+  // и весь прогон он выглядел как сервис, который просто ничего не находит.
+  const wf = db.prepare(`
+    SELECT provider, model outcome, COUNT(*) n FROM usage
+    WHERE stage='email-waterfall' GROUP BY provider, outcome`).all();
+  if (wf.length) {
+    const by = new Map();
+    for (const r of wf) {
+      const cur = by.get(r.provider) ?? { found: 0, not_found: 0, timeout: 0, error: 0 };
+      cur[r.outcome ?? 'not_found'] = (cur[r.outcome ?? 'not_found'] ?? 0) + r.n;
+      by.set(r.provider, cur);
+    }
+    L.push('');
+    L.push('  СЕРВИСЫ ПОИСКА ПОЧТ');
+    L.push(`    ${'сервис'.padEnd(14)}${'нашёл'.padStart(7)}${'запросов'.padStart(10)}${'таймаут'.padStart(9)}${'ошибок'.padStart(8)}`);
+    for (const [name, c] of by) {
+      const asked = c.found + c.not_found;
+      L.push(`    ${name.padEnd(14)}${pad(c.found, 7)}${pad(asked, 10)}${pad(c.timeout, 9)}${pad(c.error, 8)}`);
+    }
+    for (const [name, c] of by) {
+      const asked = c.found + c.not_found;
+      if (c.timeout >= 2) {
+        L.push('');
+        L.push(`    ⚠️  ${name}: ${c.timeout} ${plural(c.timeout, 'раз', 'раза', 'раз')} не ответил вовремя — это НЕ «не нашёл».`);
+        L.push('       Увеличьте ENRICH_POLL_SECONDS в .env (сейчас '
+             + (process.env.ENRICH_POLL_SECONDS || 180) + ' с) и повторите этап.');
+      } else if (asked >= 20 && c.found === 0) {
+        L.push('');
+        L.push(`    ⚠️  ${name}: ${asked} запросов и ни одной почты. На такой выборке это`);
+        L.push('       подозрительно — обычно так выглядит не пустая база, а поломка на нашей');
+        L.push('       стороне: не тот формат запроса, не то поле в ответе, слишком короткое');
+        L.push('       ожидание. Проверьте: ENRICH_DEBUG=true node run.js emails --only 3');
+        L.push(`       и сверьте сырой ответ ${name} с разбором в src/enrich.js.`);
+      }
     }
   }
 

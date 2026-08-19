@@ -65,10 +65,42 @@ function record(db, { stage, model, companyId, usage, batch }) {
   });
 }
 
+/** Модель недоступна аккаунту: дальше все вызовы упадут так же.
+ *
+ *  Отдельный случай, потому что выглядит он безобидно. Прогон идёт, строки
+ *  бегут, в конце ноль результатов и ноль расходов — а причина одна и та же
+ *  ошибка на каждой строке. Ловим её один раз, объясняем и перестаём ходить
+ *  в API: молчаливый прогон вхолостую дороже остановки. */
+let unavailable = null;
+export const modelUnavailable = () => unavailable;
+
+const isUnavailable = (e) => {
+  const m = String(e?.message ?? '');
+  return e?.status === 404 && /does not exist|must be verified|model_not_found/i.test(m);
+};
+
 /** Один синхронный вызов со структурированным ответом. */
 export async function askJson(client, db, { stage, model, system, user, schema, companyId, maxTokens = 2000 }) {
+  if (unavailable) return { ok: false, error: unavailable.short };
   const p = getProvider();
-  const r = await p.ask(client, { model, system, user, schema, maxTokens });
+  let r;
+  try {
+    r = await p.ask(client, { model, system, user, schema, maxTokens });
+  } catch (e) {
+    if (!isUnavailable(e)) throw e;
+    const verify = /must be verified/i.test(String(e.message));
+    unavailable = { model, short: `модель ${model} недоступна аккаунту` };
+    process.stderr.write(
+      `\n\n  ⛔  Модель ${model} недоступна вашему аккаунту ${p.name}.\n`
+    + (verify
+        ? '      Аккаунт не верифицирован для этой модели. Верификация разовая\n'
+        + '      и бесплатная: platform.openai.com/settings/organization/general,\n'
+        + '      кнопка Verify Organization.\n'
+        : `      ${String(e.message).slice(0, 160)}\n`)
+    + '      Либо укажите другую модель в .env и перезапустите этап.\n'
+    + '      Дальнейшие вызовы прекращены, чтобы не гонять прогон вхолостую.\n\n');
+    return { ok: false, error: unavailable.short };
+  }
   record(db, { stage, model, companyId, usage: r.usage, batch: false });
   return r.ok ? { ok: true, data: r.data } : { ok: false, error: r.error };
 }

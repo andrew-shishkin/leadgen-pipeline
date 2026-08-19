@@ -69,6 +69,11 @@ export function builtinQueries(company, titles) {
   }));
 }
 
+/** Встроенный поиск живёт внутри API Anthropic. На OpenAI его нет вовсе,
+ *  и раньше это выяснялось только в прогоне: режим «Яндекс + Google»
+ *  предлагался всем, а потом падал с ошибкой на каждой компании. */
+export const builtinAvailable = () => getProvider().name === 'anthropic';
+
 /** Ключи есть, но выбран другой поиск — сказать вслух, а не молчать. */
 export function searchProviderNote() {
   const set = (process.env.SEARCH_PROVIDER ?? '').trim().toLowerCase();

@@ -9,13 +9,13 @@ import fs from 'node:fs';
 import { openDb, costReport, unj, setMeta, getMeta } from './src/db.js';
 import { importCsv, fetchHomepages, qualify, collectQualify, toCSV } from './src/stages.js';
 import { j } from './src/db.js';
-import { makeClient, modelName, getProvider } from './src/llm.js';
+import { makeClient, modelName, getProvider, modelUnavailable } from './src/llm.js';
 import readline from 'node:readline/promises';
 import { finalReport } from './src/report.js';
 import { enrichPages, retryWithBrowser, peopleFromPages, peopleFromSearch,
          matchTitles, verifyPeople, findEmails, validateEmails, declineNames, loadTitles } from './src/stages-people.js';
 import { browserAvailable, installHint, closeBrowser } from './src/browser.js';
-import { searchProviderName, buildQueries, builtinQueries, yandexKeysPresent } from './src/search.js';
+import { searchProviderName, buildQueries, builtinQueries, yandexKeysPresent, builtinAvailable } from './src/search.js';
 import { activeProviders } from './src/enrich.js';
 import { exportAll } from './src/export.js';
 import { printCheck, collectStatus } from './src/check.js';
@@ -26,6 +26,12 @@ if (commentedOut.length) {
   for (const k of commentedOut) console.log(`        # ${k}=...`);
   console.log('      Скрипт их НЕ ВИДИТ. Уберите # в начале этих строк.\n');
 }
+
+process.on('exit', () => {
+  const u = modelUnavailable();
+  if (u) console.log(`\n  ⛔  Прогон остановлен: модель ${u.model} недоступна аккаунту.`
+                   + '\n      Результаты неполные — исправьте модель в .env и повторите этап.\n');
+});
 
 const [cmd, ...args] = process.argv.slice(2);
 const flag = (n, d) => { const i = args.indexOf('--' + n); return i === -1 ? d : (args[i + 1] ?? true); };
@@ -266,11 +272,20 @@ switch (cmd) {
       const line = (v) => `${money2(v)} за строку · ${money2(v * pass)} за все ${pass}`;
 
       let mode = getMeta(db, 'search_mode', null) ?? String(flag('search', '') || '');
+      // Встроенный поиск живёт внутри API Anthropic. На OpenAI его нет,
+      // и предлагать его там нельзя: раньше режим выбирался, а потом падал
+      // с ошибкой на каждой компании — стеной одинаковых строк в логе.
+      const canGoogle = builtinAvailable();
+      if (!canGoogle && ['builtin', 'both'].includes(mode)) {
+        console.log(`  Режим «${mode}» просит Google, но встроенный поиск есть только у Anthropic.`);
+        console.log('  Переключаюсь на Яндекс. Вернуть Google: LLM_PROVIDER=anthropic в .env.');
+        mode = 'yandex'; setMeta(db, 'search_mode', mode);
+      }
       if (!['yandex', 'builtin', 'both'].includes(mode)) {
         const opts = [];
-        if (yandexKeysPresent()) opts.push({ value: 'both', label: 'Яндекс + Google — максимум находок',
+        if (yandexKeysPresent() && canGoogle) opts.push({ value: 'both', label: 'Яндекс + Google — максимум находок',
           hint: line(yandex + google + parse) + '  · российские площадки и LinkedIn' });
-        opts.push({ value: 'builtin', label: 'только Google (встроенный поиск)',
+        if (canGoogle) opts.push({ value: 'builtin', label: 'только Google (встроенный поиск)',
           hint: line(google + parse) + '  · видит LinkedIn, ключей не нужно' });
         if (yandexKeysPresent()) opts.push({ value: 'yandex', label: 'только Яндекс',
           hint: line(yandex + parse) + '  · российские площадки, LinkedIn не видит' });
@@ -333,10 +348,45 @@ switch (cmd) {
       console.log('  много ли найдётся на всём списке, нельзя — и не нужно: запрос');
       console.log('  без результата кредит обычно не списывает.');
     }
-    const r = await findEmails(db, client, { source, limit: only ? Number(only) : undefined, onProgress: bar });
+    // Подбор по шаблону — последняя попытка для тех, кого не нашёл ни один
+    // сервис. Тратит кредиты валидатора, поэтому спрашиваем, а не решаем сами.
+    let guess = getMeta(db, 'guess_emails', null);
+    if (guess === null && source !== 'site' && (process.env.ZEROBOUNCE_API_KEY ?? '').trim()) {
+      const left = db.prepare(`SELECT COUNT(*) n FROM people p JOIN companies c ON c.id=p.company_id
+        WHERE c.icp_status='pass' AND p.email IS NULL AND p.title_match='pass'
+          AND p.verified IN ('true','unknown','trusted') AND c.domain IS NOT NULL`).get().n;
+      const cap = Number(process.env.GUESS_MAX_CHECKS ?? 6);
+      if (left) {
+        console.log('\n  Для части людей почту не найдёт ни один сервис. Для них есть');
+        console.log('  последняя попытка: собрать адрес по частым шаблонам (i.ivanov@,');
+        console.log('  ivanov@, ivan.ivanov@ и так далее) и проверить каждый в ZeroBounce.');
+        console.log('  Берём только те, что валидатор назвал valid.');
+        console.log('');
+        console.log('  Важно про домены catch-all: они принимают любую почту, и отличить');
+        console.log('  настоящий адрес от выдуманного на них нельзя. Такие домены мы');
+        console.log('  распознаём с первой проверки и сразу прекращаем подбор — ни одной');
+        console.log('  догадки в выгрузке не появится.');
+        console.log('');
+        console.log(`  Цена: до ${cap} кредитов ZeroBounce на человека, людей сейчас ${left}.`);
+        console.log(`  Худший случай — ${left * cap} кредитов, обычно заметно меньше:`);
+        console.log('  подбор останавливается на первом подтверждённом адресе и на catch-all.');
+        guess = await ask('Подбирать почты по шаблону?', [
+          { value: 'no',  label: 'нет — только то, что нашли сервисы' },
+          { value: 'yes', label: 'да — потратить кредиты валидатора на подбор' },
+        ]);
+        setMeta(db, 'guess_emails', guess);
+      }
+    }
+
+    const r = await findEmails(db, client, { source, guess: guess === 'yes',
+      limit: only ? Number(only) : undefined, onProgress: bar });
     console.log(`\n  найдено шаблонами (бесплатно): ${r.matched ?? 0}`);
     console.log(`  подобрано нейросетью:          ${r.byLlm ?? 0}`);
     console.log(`  куплено у провайдеров:         ${r.bought ?? 0}`);
+    if (r.guessQueue) {
+      console.log(`  подобрано по шаблону:          ${r.guessed ?? 0}   из ${r.guessQueue} попыток`);
+      if (r.catchAll) console.log(`    из них доменов catch-all:    ${r.catchAll}   подбор там невозможен`);
+    }
     console.log(`  не нашлось:                    ${r.notFound ?? 0}`);
 
     const v = await validateEmails(db, { onProgress: bar });

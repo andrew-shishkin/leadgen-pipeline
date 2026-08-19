@@ -89,16 +89,93 @@ const TRANSLIT = {
 };
 export const translit = (s) => (s ?? '').toLowerCase().split('').map((c) => TRANSLIT[c] ?? c).join('');
 
-/** Разбор «Иванов Пётр Сергеевич» на части. Отчество узнаётся по окончанию. */
+const cap = (w) => (w ? w[0].toUpperCase() + w.slice(1) : w);
+const hasCyrillic = (s) => /[а-яё]/i.test(s ?? '');
+
+/** Транслитерация с подменой отдельных букв — для альтернативных написаний. */
+const translitWith = (s, alt) => (s ?? '').toLowerCase().split('')
+  .map((c) => alt[c] ?? TRANSLIT[c] ?? c).join('');
+
+/** ФИО латиницей для сервисов поиска почт: «Казаков» → «Kazakov».
+ *
+ *  Prospeo, Wiza, FullEnrich и остальные ищут по латинице. Кириллическое
+ *  «Казаков Игорь Михайлович» для них — не имя, а строка без совпадений,
+ *  поэтому в сервисы уходит только транслитерированный вариант, всегда,
+ *  независимо от того, как ФИО записано в исходном файле. */
+export const translitName = (s) => (s ?? '')
+  .split(/([\s-]+)/)
+  .map((part) => (/^[\s-]+$/.test(part) ? part : cap(translit(part))))
+  .join('');
+
+/** Буквы, которые в разных базах транслитерируют по-разному. */
+const ALT_MAPS = [
+  { х: 'h' },                 // Михаил: Mikhail → Mihail
+  { щ: 'sch' },               // Щербаков: Shcherbakov → Scherbakov
+  { ю: 'iu', я: 'ia' },       // Юрий: Yuriy → Iuriy
+];
+
+/**
+ * Другие написания того же имени латиницей. Первым идёт основное.
+ *
+ * Зачем: сервисы поиска почт ищут по точному совпадению. На «Evgenii»
+ * отвечают «не найдено», на «Evgeniy» отдают адрес — и наоборот. Проверено
+ * на живых прогонах в Clay, работает в обе стороны, поэтому одного
+ * написания мало.
+ *
+ * Варианты строятся от кириллицы подменой букв, а не регулярками по готовой
+ * латинице: правило «h → kh» по латинице портит всё подряд, превращая
+ * Merkulovich в Merkulovickh, а Shcherbakova в Skhckherbakova.
+ */
+export function spellingVariants(word, { max = 4 } = {}) {
+  const out = [];
+  const push = (v) => { v = cap(v); if (v && !out.includes(v)) out.push(v); };
+  const src = (word ?? '').trim();
+  if (!src) return out;
+
+  if (hasCyrillic(src)) {
+    const base = translit(src);
+    push(base);
+    for (const alt of ALT_MAPS) push(translitWith(src, alt));
+    if (/iy$/.test(base)) push(base.replace(/iy$/, 'ii'));   // Evgeniy → Evgenii
+  } else {
+    push(src);
+    if (/iy$/i.test(src)) push(src.replace(/iy$/i, 'ii'));
+    if (/ii$/i.test(src)) push(src.replace(/ii$/i, 'iy'));
+    push(src.replace(/kh/gi, 'h'));
+    // h → kh только между гласными: иначе под замену попадают ch, sh, zh
+    push(src.replace(/([aeiou])h([aeiou])/gi, '$1kh$2'));
+  }
+  return out.slice(0, max);
+}
+
+const PATRONYMIC_RE = /(ович|евич|ьич|ич|овна|евна|ична|инична|кызы|оглы)$/i;
+const looksPatronymic = (w) => PATRONYMIC_RE.test(w ?? '') && (w ?? '').length > 4;
+
+/** Разбор «Иванов Пётр Сергеевич» на части.
+ *
+ *  Отчество ищется только когда частей три и больше, и никогда — в первом
+ *  слове. Раньше оно искалось в любой позиции при любом числе частей,
+ *  и фамилия «Меркулович» становилась отчеством: у «Татьяна Меркулович»
+ *  оставалось одно имя, в сервисы поиска почт уходило «Tatyana» без фамилии,
+ *  а по такому запросу не находится ничего. Под тот же разбор попадали все
+ *  Абрамовичи, Петровичи и Миркевичи.
+ *
+ *  Позиция отчества заодно говорит и порядок слов: «Фамилия Имя Отчество»
+ *  против «Имя Отчество Фамилия». */
 export function parseFio(fio) {
   const parts = (fio ?? '').trim().split(/\s+/).filter(Boolean);
   if (!parts.length) return null;
-  const patronymicRe = /(ович|евич|ьич|ич|овна|евна|ична|инична|кызы|оглы)$/i;
-  const patronymic = parts.find((p) => patronymicRe.test(p) && p.length > 4) ?? null;
-  const rest = parts.filter((p) => p !== patronymic);
-  // в российских выгрузках почти всегда «Фамилия Имя Отчество»
-  const [last, first] = rest.length >= 2 ? rest : [rest[0], null];
-  return { last: last ?? null, first: first ?? null, patronymic, full: parts.join(' ') };
+  const full = parts.join(' ');
+
+  if (parts.length >= 3) {
+    if (looksPatronymic(parts[2])) return { last: parts[0], first: parts[1], patronymic: parts[2], full };
+    if (looksPatronymic(parts[1])) return { first: parts[0], patronymic: parts[1], last: parts[2], full };
+  }
+  // Отчества нет: «Фамилия Имя» либо «Имя Фамилия». Какой из двух — решает
+  // SURNAME_RE в personVariants, а обратный порядок уходит в сервисы
+  // отдельным вариантом.
+  const [last, first] = parts.length >= 2 ? [parts[0], parts[1]] : [parts[0], null];
+  return { last: last ?? null, first: first ?? null, patronymic: null, full };
 }
 
 /** Кандидаты локалпартов для человека: покрывают массовые шаблоны российских компаний. */
@@ -114,6 +191,62 @@ export function emailPatterns(fio) {
     `${f}${m}${L[0] ?? ''}`, `${L[0] ?? ''}${f}${m}`,
   ].filter((x) => x && x.length > 1));
   return [...out];
+}
+
+/**
+ * Шаблоны для подбора почты «вслепую» — в порядке убывания частоты
+ * в российском B2B. Порядок важен: каждая проверка стоит кредит
+ * валидатора, а берём мы первую подтвердившуюся.
+ */
+export function guessPatterns(fio) {
+  const p = parseFio(fio);
+  if (!p?.last) return [];
+  const L = translit(p.last), F = translit(p.first ?? ''), M = translit(p.patronymic ?? '');
+  const f = F[0] ?? '', m = M[0] ?? '';
+  return [...new Set([
+    f && `${f}.${L}`, L, F && `${F}.${L}`, f && `${f}${L}`, `${L}.${f}`, F,
+    `${L}${f}`, f && `${f}_${L}`, F && `${F}${L}`, m && `${f}.${m}.${L}`,
+    m && `${L}.${f}.${m}`,
+  ].filter((x) => x && x.length > 1))];
+}
+
+/** Похоже на фамилию, а не на имя. Нужно, чтобы различить «Дарья Снедкова»
+ *  и «Ильин Евгений»: сервису важно, что из двух слов имя, а что фамилия. */
+const SURNAME_RE = new RegExp(
+  '(ов|ова|ев|ева|ёв|ёва|ин|ина|ын|ына|ский|ская|цкий|цкая|ич|ук|юк|ко|швили|дзе|ян|енко' +
+  '|ov|ova|ev|eva|in|ina|sky|skiy|skaya|tsky|ich|enko|shvili|dze|yan)$', 'i');
+
+/**
+ * Варианты запроса о человеке для сервисов поиска почт — в порядке
+ * убывания вероятности. Первый основной, остальные пробуются, только если
+ * сервис ответил «не найдено».
+ */
+export function personVariants(fio, { max = Number(process.env.ENRICH_NAME_VARIANTS ?? 3) } = {}) {
+  const p = parseFio(fio);
+  if (!p?.last) return [];
+
+  // Без отчества порядок слов по строке не определить. Смотрим на окончание:
+  // «Снедкова» — фамилия, значит «Дарья Снедкова» это Имя + Фамилия.
+  let first = p.first, last = p.last;
+  if (!p.patronymic && first && last) {
+    // parseFio отдал первое слово как фамилию. Если на фамилию похоже
+    // ВТОРОЕ слово, а первое — нет, значит порядок был «Имя Фамилия».
+    if (SURNAME_RE.test(first) && !SURNAME_RE.test(last)) [first, last] = [last, first];
+  }
+
+  const out = [], seen = new Set();
+  const push = (f, l) => {
+    const full = [f, l].filter(Boolean).join(' ');
+    const k = full.toLowerCase();
+    if (l && !seen.has(k)) { seen.add(k); out.push({ first: f || '', last: l, full }); }
+  };
+
+  const F = spellingVariants(first ?? ''), L = spellingVariants(last);
+  push(F[0], L[0]);
+  for (const f of F.slice(1)) push(f, L[0]);
+  for (const l of L.slice(1)) push(F[0], l);
+  if (!p.patronymic && F[0] && L[0]) push(L[0], F[0]);   // порядок мог быть обратным
+  return out.slice(0, Math.max(1, max));
 }
 
 /**

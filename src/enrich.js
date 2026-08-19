@@ -11,6 +11,7 @@
 
 import { withRetry } from './http.js';
 import { logUsage } from './db.js';
+import { personVariants, translitName, guessPatterns } from './emails.js';
 
 const dbg = (name, payload) => {
   if ((process.env.ENRICH_DEBUG ?? '') === 'true')
@@ -60,14 +61,34 @@ const jsonGet = async (url, headers) => {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** Сколько ждать асинхронный сервис, секунд. FullEnrich отвечает примерно
+ *  за 70 секунд, а ждали мы 35 (14 опросов × 2.5 с) и записывали результат
+ *  как «не найдено». Сервис ни разу не успел ответить за весь прогон, и по
+ *  отчёту это выглядело так, будто он ничего не находит. */
+const POLL_SECONDS = Number(process.env.ENRICH_POLL_SECONDS ?? 180);
+
+/** Возвращается, когда сервис не ответил за отведённое время. Это НЕ «не
+ *  найдено»: такой случай надо показать пользователю отдельно, иначе
+ *  медленный сервис молча выглядит бесполезным. */
+const TIMEOUT = Symbol('timeout');
+
 /** Опрос асинхронной задачи, пока не появится результат. */
-async function poll(fn, { tries = 14, delay = 2500 } = {}) {
+async function poll(fn, { seconds = POLL_SECONDS, delay = 3000 } = {}) {
+  const tries = Math.max(1, Math.ceil((seconds * 1000) / delay));
   for (let i = 0; i < tries; i++) {
     await sleep(delay);
     const r = await fn();
     if (r !== undefined) return r;      // undefined = ещё считается
   }
-  return null;
+  return TIMEOUT;
+}
+
+/** Превратить таймаут в явную ошибку провайдера. */
+function orTimeout(r, name) {
+  if (r !== TIMEOUT) return r;
+  const e = new Error(`${name}: не ответил за ${POLL_SECONDS} с`);
+  e.providerIssue = true; e.timeout = true;
+  throw e;
 }
 
 const keepPersonal = () => (process.env.KEEP_PERSONAL_EMAILS ?? 'true') !== 'false';
@@ -119,7 +140,7 @@ const PROVIDERS = [
           const e = new Error(`Wiza: ${d.data.fail_error}`); e.providerIssue = true; throw e;
         }
         return findEmailDeep(d.data) ?? null;
-      });
+      }).then((r) => orTimeout(r, 'Wiza'));
     },
   },
   {
@@ -140,7 +161,7 @@ const PROVIDERS = [
         if (status && !['finished', 'completed', 'done'].includes(status)) return undefined;
         dbg('fullenrich:done', d);
         return findEmailDeep(d) ?? null;
-      });
+      }).then((r) => orTimeout(r, 'FullEnrich'));
     },
   },
 ];
@@ -150,7 +171,7 @@ export const activeProviders = () =>
 
 /** Порядок из .env: EMAIL_WATERFALL=prospeo,findymail,wiza,fullenrich */
 function ordered() {
-  const want = (process.env.EMAIL_WATERFALL || 'prospeo,findymail,wiza,fullenrich')
+  const want = (process.env.EMAIL_WATERFALL || 'wiza,prospeo,fullenrich,findymail')
     .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
   const active = activeProviders();
   const byName = Object.fromEntries(active.map((p) => [p.name, p]));
@@ -166,32 +187,97 @@ function ordered() {
 // съедает по минуте на каждом человеке и растягивает прогон на часы.
 const FAILS = new Map();
 const FAIL_LIMIT = 2;
+
+/** Исход вызова сервиса. Пишем в колонку model — для этих строк она пустая,
+ *  а разбивка «кто сколько нашёл» нужна в отчёте и должна переживать
+ *  перезапуск, поэтому храним в базе, а не в памяти процесса. */
+const note = (db, provider, outcome) =>
+  logUsage(db, { stage: 'email-waterfall', provider, model: outcome, units: 1, usd: 0 });
 export const disabledProviders = () =>
   [...FAILS.entries()].filter(([, v]) => v.count >= FAIL_LIMIT).map(([k, v]) => `${k}: ${v.reason}`);
 
+/**
+ * Найти почту человека.
+ *
+ * Два уровня перебора. Внешний — сервисы по порядку из EMAIL_WATERFALL.
+ * Внутренний — написания имени: сервисы ищут по точному совпадению, и на
+ * «Evgenii» отвечают «не найдено», а на «Evgeniy» отдают адрес. Поэтому
+ * прежде чем идти к следующему сервису, спрашиваем текущий про остальные
+ * написания того же человека (см. personVariants).
+ *
+ * В сервисы уходит ТОЛЬКО латиница, всегда. Кириллическое «Казаков Игорь
+ * Михайлович» для них не имя, а строка без совпадений: раньше ФИО уходило
+ * как записано в базе, и по кириллическим строкам не находилось ничего.
+ *
+ * Итог: { email, source, variant } либо { email: null, tried: [...] }.
+ */
 export async function findEmail(db, person) {
   const chain = ordered();
   const tried = [];
+  // если ФИО разобрать не удалось — идём с тем, что дали, но латиницей
+  const variants = personVariants(person.full ?? '')
+    .map((v) => ({ ...person, ...v }));
+  const queue = variants.length ? variants : [{ ...person,
+    first: translitName(person.first ?? ''), last: translitName(person.last ?? ''),
+    full: translitName(person.full ?? '') }];
+
   for (const p of chain) {
     const f = FAILS.get(p.name);
     if (f && f.count >= FAIL_LIMIT) { tried.push(`${p.name}(отключён)`); continue; }
-
     const key = process.env[p.env];
-    try {
-      const email = await withRetry(() => p.find(person, key), { tries: 3 });
-      logUsage(db, { stage: 'email-waterfall', provider: p.name, units: 1, usd: 0 });
-      FAILS.delete(p.name);
-      tried.push(p.name);
-      if (email) return { email, source: p.name, tried };
-    } catch (e) {
-      const reason = e.providerIssue ? e.message : `ошибка ${e.status ?? e.message?.slice(0, 40)}`;
-      const cur = FAILS.get(p.name) ?? { count: 0, reason };
-      FAILS.set(p.name, { count: cur.count + 1, reason });
-      tried.push(`${p.name}(${reason})`);
-      logUsage(db, { stage: 'email-waterfall', provider: p.name, units: 1, usd: 0 });
+
+    for (const [i, v] of queue.entries()) {
+      try {
+        const email = await withRetry(() => p.find(v, key), { tries: 3 });
+        note(db, p.name, email ? 'found' : 'not_found');
+        FAILS.delete(p.name);
+        tried.push(i ? `${p.name}:${v.full}` : p.name);
+        if (email) return { email, source: p.name, variant: v.full, tried };
+      } catch (e) {
+        const reason = e.providerIssue ? e.message : `ошибка ${e.status ?? e.message?.slice(0, 40)}`;
+        const cur = FAILS.get(p.name) ?? { count: 0, reason };
+        FAILS.set(p.name, { count: cur.count + 1, reason });
+        tried.push(`${p.name}(${reason})`);
+        note(db, p.name, e.timeout ? 'timeout' : 'error');
+        break;                       // сервис сломан — другие написания не помогут
+      }
     }
   }
   return { email: null, tried };
+}
+
+/**
+ * Последняя попытка, когда ни один сервис почту не нашёл: собрать адрес
+ * по частым шаблонам и проверить валидатором.
+ *
+ * Механика и её цена. Сначала проверяем первый шаблон. Если валидатор
+ * отвечает catch-all — домен принимает любую почту, отличить настоящий
+ * адрес от выдуманного невозможно, и мы сразу прекращаем: ни одного
+ * лишнего кредита и ни одной догадки в выгрузке. Если домен не catch-all,
+ * перебираем шаблоны, пока какой-нибудь не окажется valid; всё остальное
+ * (invalid, unknown) отбрасываем. Тратится от одного до GUESS_MAX_CHECKS
+ * кредитов валидатора на человека.
+ *
+ * Берём только явный valid: догадка, попавшая в выгрузку как настоящий
+ * контакт, дороже ненайденного адреса.
+ */
+export async function guessEmail(db, { full, domain }) {
+  if (!domain) return { email: null, reason: 'нет домена компании' };
+  if (!(process.env.ZEROBOUNCE_API_KEY ?? '').trim())
+    return { email: null, reason: 'подбор без валидатора выключен' };
+
+  const limit = Number(process.env.GUESS_MAX_CHECKS ?? 6);
+  const cands = guessPatterns(full).slice(0, limit).map((l) => `${l}@${domain}`);
+  if (!cands.length) return { email: null, reason: 'не удалось разобрать ФИО' };
+
+  for (const e of cands) {
+    const v = await validateEmail(db, e);
+    if (v.status === 'catch-all')
+      return { email: null, reason: 'домен catch-all — подбор невозможен', catchAll: true };
+    if (v.status === 'valid')
+      return { email: e, reason: 'подобрана по шаблону, подтверждена валидатором' };
+  }
+  return { email: null, reason: `ни один из ${cands.length} шаблонов не подтвердился` };
 }
 
 // ─────────────────────────── Валидация ───────────────────────────
