@@ -123,7 +123,13 @@ export async function withRetry(fn, { tries = 5, base = 800 } = {}) {
       const status = e.status ?? e.response?.status;
       if (e.noRetry || e.providerIssue) throw e;              // проблема на стороне сервиса
       if (status && status < 500 && status !== 429) throw e;  // клиентская ошибка — ретрай не поможет
-      await new Promise((r) => setTimeout(r, base * 2 ** i + Math.random() * 300));
+      // 429 — это «слишком часто», а не «сломано». Ждём дольше и слушаем
+      // Retry-After: короткий backoff здесь стоил нам целого сервиса —
+      // две быстрые неудачи подряд отключали его до конца прогона.
+      const wait = status === 429
+        ? Math.max(Number(e.retryAfter) * 1000 || 0, 5000 * 2 ** i)
+        : base * 2 ** i;
+      await new Promise((r) => setTimeout(r, wait + Math.random() * 300));
     }
   }
   throw last;

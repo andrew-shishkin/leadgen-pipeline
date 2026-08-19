@@ -467,7 +467,18 @@ export async function findEmails(db, client, { model, buy = true, source, limit,
   const useSite = src !== 'providers';
   const usePaid = buy && src !== 'site';
   const keep = (process.env.KEEP_PERSONAL_EMAILS ?? 'true') !== 'false';
-  const setEmail = db.prepare(`UPDATE people SET email=?, email_source=? WHERE id=?`);
+  // email_status обязательно сбрасывается вместе с новой почтой.
+  //
+  // Без этого получалась тихая подмена: адрес отбраковывался валидацией
+  // (email=NULL, email_status='отбракована: do_not_mail'), в следующем прогоне
+  // сервис находил новый адрес, запись обновлялась — а старый статус
+  // оставался. validateEmails() берёт только строки с email_status IS NULL,
+  // поэтому новый адрес больше никогда не проверялся и уезжал в выгрузку
+  // с чужой отметкой «отбракована», выглядя при этом годным.
+  const setEmail = db.prepare(`UPDATE people SET email=?, email_source=?, email_status=NULL WHERE id=?`);
+  // отдельный вариант для уже проверенных адресов: подбор по шаблону берёт
+  // только те, что валидатор прямо назвал valid, — платить за них второй раз незачем
+  const setEmailChecked = db.prepare(`UPDATE people SET email=?, email_source=?, email_status=? WHERE id=?`);
   const stat = { matched: 0, byLlm: 0, bought: 0, notFound: 0, source: src,
                  providers: activeProviders().map((p) => p.name) };
 
@@ -558,7 +569,7 @@ export async function findEmails(db, client, { model, buy = true, source, limit,
     if (rest.length) process.stdout.write(`\n  подбор по шаблону: ${rest.length} человек, каждая проверка — кредит валидатора\n`);
     await mapLimit(rest, 3, async (p) => {
       const g = await guessEmail(db, { full: p.full_name, domain: p.domain });
-      if (g.email) { setEmail.run(g.email, 'подобрана по шаблону', p.id); stat.guessed++; }
+      if (g.email) { setEmailChecked.run(g.email, 'подобрана по шаблону', 'valid', p.id); stat.guessed++; }
       else if (g.catchAll) stat.catchAll++;
     }, onProgress);
   }

@@ -89,6 +89,22 @@ const TRANSLIT = {
 };
 export const translit = (s) => (s ?? '').toLowerCase().split('').map((c) => TRANSLIT[c] ?? c).join('');
 
+/** Регистрируемый домен компании: «php.i-neti.ru» → «i-neti.ru».
+ *
+ *  Сервисы поиска почт ждут домен компании, а из исходного файла к нам
+ *  приходит адрес страницы: agency.sape.ru, spb.lanit.ru, php.i-neti.ru.
+ *  По поддомену человек не находится, хотя по самой компании нашёлся бы.
+ *  Двухсоставные зоны (co.uk, com.br) учтены отдельно, а «pride.marketing»
+ *  трогать нельзя — там marketing и есть зона верхнего уровня. */
+const TWO_PART_TLD = new Set(['co.uk', 'org.uk', 'ac.uk', 'com.au', 'co.nz', 'com.br', 'co.jp', 'com.tr', 'co.il']);
+export function rootDomain(host) {
+  const h = String(host ?? '').toLowerCase().replace(/^https?:\/\//, '').split('/')[0].replace(/^www\./, '');
+  const p = h.split('.').filter(Boolean);
+  if (p.length <= 2) return h;
+  const keep = TWO_PART_TLD.has(p.slice(-2).join('.')) ? 3 : 2;
+  return p.slice(-keep).join('.');
+}
+
 const cap = (w) => (w ? w[0].toUpperCase() + w.slice(1) : w);
 const hasCyrillic = (s) => /[а-яё]/i.test(s ?? '');
 
@@ -107,11 +123,27 @@ export const translitName = (s) => (s ?? '')
   .map((part) => (/^[\s-]+$/.test(part) ? part : cap(translit(part))))
   .join('');
 
-/** Буквы, которые в разных базах транслитерируют по-разному. */
+/** Целые системы транслитерации, а не отдельные буквы.
+ *
+ *  Одно и то же имя в разных базах записано по разной системе, и сервисы
+ *  ищут по точному совпадению. Проверено на выгрузке из Clay: из двадцати
+ *  ФИО девять писались не так, как у нас, и почти все расхождения —
+ *  это не опечатки, а другая система.
+ *
+ *  Порядок важен: каждая система — отдельный платный запрос к сервису. */
 const ALT_MAPS = [
+  // загранпаспорт (ИКАО): Паймышев → Paimyshev, Гайдаенко → Gaidaenko
+  { й: 'i', ю: 'iu', я: 'ia' },
   { х: 'h' },                 // Михаил: Mikhail → Mihail
+  { ё: 'yo' },                // Семёнов: Semenov → Semyonov
   { щ: 'sch' },               // Щербаков: Shcherbakov → Scherbakov
-  { ю: 'iu', я: 'ia' },       // Юрий: Yuriy → Iuriy
+];
+
+/** Окончания, которые в англоязычных базах пишут короче. */
+const ALT_ENDINGS = [
+  [/skiy$/i, 'sky'],          // Вознесенский: Voznesenskiy → Voznesensky
+  [/iy$/i, 'ii'],             // Евгений: Evgeniy → Evgenii
+  [/iy$/i, 'i'],              // Юрий: Yuriy → Yuri
 ];
 
 /**
@@ -126,7 +158,7 @@ const ALT_MAPS = [
  * латинице: правило «h → kh» по латинице портит всё подряд, превращая
  * Merkulovich в Merkulovickh, а Shcherbakova в Skhckherbakova.
  */
-export function spellingVariants(word, { max = 4 } = {}) {
+export function spellingVariants(word, { max = 5 } = {}) {
   const out = [];
   const push = (v) => { v = cap(v); if (v && !out.includes(v)) out.push(v); };
   const src = (word ?? '').trim();
@@ -136,10 +168,12 @@ export function spellingVariants(word, { max = 4 } = {}) {
     const base = translit(src);
     push(base);
     for (const alt of ALT_MAPS) push(translitWith(src, alt));
-    if (/iy$/.test(base)) push(base.replace(/iy$/, 'ii'));   // Evgeniy → Evgenii
+    for (const [re, to] of ALT_ENDINGS) if (re.test(base)) push(base.replace(re, to));
+    // «и» перед гласной часто пишут со скользящей y: Кафиатуллин → Kafiyatullin
+    if (/i[aeou]/.test(base)) push(base.replace(/i([aeou])/g, 'iy$1'));
   } else {
     push(src);
-    if (/iy$/i.test(src)) push(src.replace(/iy$/i, 'ii'));
+    for (const [re, to] of ALT_ENDINGS) if (re.test(src)) push(src.replace(re, to));
     if (/ii$/i.test(src)) push(src.replace(/ii$/i, 'iy'));
     push(src.replace(/kh/gi, 'h'));
     // h → kh только между гласными: иначе под замену попадают ch, sh, zh
@@ -213,7 +247,7 @@ export function guessPatterns(fio) {
 /** Похоже на фамилию, а не на имя. Нужно, чтобы различить «Дарья Снедкова»
  *  и «Ильин Евгений»: сервису важно, что из двух слов имя, а что фамилия. */
 const SURNAME_RE = new RegExp(
-  '(ов|ова|ев|ева|ёв|ёва|ин|ина|ын|ына|ский|ская|цкий|цкая|ич|ук|юк|ко|швили|дзе|ян|енко' +
+  '(ов|ова|ев|ева|ёв|ёва|ин|ина|ын|ына|ский|ская|цкий|цкая|ич|ук|юк|ко|швили|дзе|ян|енко|ых|их' +
   '|ov|ova|ev|eva|in|ina|sky|skiy|skaya|tsky|ich|enko|shvili|dze|yan)$', 'i');
 
 /**
@@ -221,7 +255,7 @@ const SURNAME_RE = new RegExp(
  * убывания вероятности. Первый основной, остальные пробуются, только если
  * сервис ответил «не найдено».
  */
-export function personVariants(fio, { max = Number(process.env.ENRICH_NAME_VARIANTS ?? 3) } = {}) {
+export function personVariants(fio, { max = Number(process.env.ENRICH_NAME_VARIANTS ?? 4) } = {}) {
   const p = parseFio(fio);
   if (!p?.last) return [];
 

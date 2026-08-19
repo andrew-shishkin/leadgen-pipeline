@@ -11,7 +11,7 @@
 
 import { withRetry } from './http.js';
 import { logUsage } from './db.js';
-import { personVariants, translitName, guessPatterns } from './emails.js';
+import { personVariants, translitName, guessPatterns, rootDomain } from './emails.js';
 
 const dbg = (name, payload) => {
   if ((process.env.ENRICH_DEBUG ?? '') === 'true')
@@ -32,7 +32,8 @@ const jsonPost = async (url, headers, body) => {
     // «человека нет в базе» некоторые провайдеры отдают кодом 400 — это
     // штатный ответ, а не поломка, и кредит за него не списывается
     if (isNotFound(data)) return { __notFound: true };
-    const e = new Error(`${r.status}: ${text.slice(0, 200)}`); e.status = r.status; e.data = data; throw e;
+    const e = new Error(`${r.status}: ${text.slice(0, 200)}`);
+    e.status = r.status; e.data = data; e.retryAfter = r.headers.get('retry-after'); throw e;
   }
   return data;
 };
@@ -55,7 +56,8 @@ const jsonGet = async (url, headers) => {
   const r = await fetch(url, { headers });
   const text = await r.text();
   let data; try { data = JSON.parse(text); } catch { data = { _raw: text.slice(0, 400) }; }
-  if (!r.ok) { const e = new Error(`${r.status}: ${text.slice(0, 200)}`); e.status = r.status; throw e; }
+  if (!r.ok) { const e = new Error(`${r.status}: ${text.slice(0, 200)}`);
+    e.status = r.status; e.retryAfter = r.headers.get('retry-after'); throw e; }
   return data;
 };
 
@@ -217,9 +219,10 @@ export async function findEmail(db, person) {
   // если ФИО разобрать не удалось — идём с тем, что дали, но латиницей
   const variants = personVariants(person.full ?? '')
     .map((v) => ({ ...person, ...v }));
-  const queue = variants.length ? variants : [{ ...person,
+  const domain = rootDomain(person.domain);
+  const queue = (variants.length ? variants : [{ ...person,
     first: translitName(person.first ?? ''), last: translitName(person.last ?? ''),
-    full: translitName(person.full ?? '') }];
+    full: translitName(person.full ?? '') }]).map((v) => ({ ...v, domain }));
 
   for (const p of chain) {
     const f = FAILS.get(p.name);
@@ -235,11 +238,17 @@ export async function findEmail(db, person) {
         if (email) return { email, source: p.name, variant: v.full, tried };
       } catch (e) {
         const reason = e.providerIssue ? e.message : `ошибка ${e.status ?? e.message?.slice(0, 40)}`;
-        const cur = FAILS.get(p.name) ?? { count: 0, reason };
-        FAILS.set(p.name, { count: cur.count + 1, reason });
-        tried.push(`${p.name}(${reason})`);
-        note(db, p.name, e.timeout ? 'timeout' : 'error');
-        break;                       // сервис сломан — другие написания не помогут
+        // 429 — превышен лимит запросов. Это состояние минуты, а не поломка
+        // сервиса: раньше два таких ответа подряд выключали провайдера
+        // до конца прогона, и люди, которых находил только он, терялись молча.
+        const rateLimited = e.status === 429;
+        if (!rateLimited) {
+          const cur = FAILS.get(p.name) ?? { count: 0, reason };
+          FAILS.set(p.name, { count: cur.count + 1, reason });
+        }
+        tried.push(`${p.name}(${rateLimited ? 'лимит запросов' : reason})`);
+        note(db, p.name, rateLimited ? 'rate_limit' : (e.timeout ? 'timeout' : 'error'));
+        break;                       // на этом человеке дальше не пробуем
       }
     }
   }
@@ -266,7 +275,10 @@ export async function guessEmail(db, { full, domain }) {
   if (!(process.env.ZEROBOUNCE_API_KEY ?? '').trim())
     return { email: null, reason: 'подбор без валидатора выключен' };
 
-  const limit = Number(process.env.GUESS_MAX_CHECKS ?? 6);
+  // Предел покрывает весь список шаблонов (их 9-11 на человека). Он срабатывает
+  // только когда не подошёл ни один: подбор останавливается на первом valid
+  // и на catch-all, так что обычный расход — одна-две проверки, а не двенадцать.
+  const limit = Number(process.env.GUESS_MAX_CHECKS ?? 12);
   const cands = guessPatterns(full).slice(0, limit).map((l) => `${l}@${domain}`);
   if (!cands.length) return { email: null, reason: 'не удалось разобрать ФИО' };
 
