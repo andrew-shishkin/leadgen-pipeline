@@ -4,7 +4,8 @@
 import fs from 'node:fs';
 import { unj, getMeta } from './db.js';
 import { toCSV, normalizeVerdict } from './stages.js';
-import { pickGenericEmail, matchEmailToPerson, parseFio, domainPart, relatedToCompany, classifyMailbox } from './emails.js';
+import { pickGenericEmail, matchEmailToPerson, orderedFio, domainPart, relatedToCompany, classifyMailbox } from './emails.js';
+import { dativeFio } from './names.js';
 import { isFreeMail } from './extract.js';
 
 const list = (s) => unj(s) ?? [];
@@ -78,12 +79,15 @@ export function exportAll(db, { dir = 'out', keepPersonal = true, generic, depar
 
     if (withEmail.length) {
       for (const { p, email } of withEmail) {
-        const f = parseFio(p.full_name);
+        // Запасной путь на случай, если этап склонения не отработал.
+        // Раньше здесь брался parseFio, считающий первое слово фамилией,
+        // и у «Ирина Шамина» в обращение уходило «Шамина», а «кому» пустело.
+        const f = orderedFio(p.full_name);
         const nom = p.name_nominative || [f?.first, f?.patronymic].filter(Boolean).join(' ');
         t2.push({
           'ФИО': p.full_name,
           'Имя Отчество (кто)': nom,
-          'Имя Отчество (кому)': p.name_dative ?? '',
+          'Имя Отчество (кому)': p.name_dative || dativeFio(nom),
           'Должность': p.title ?? '',
           'Почта': email,
           'Тип почты': isFreeMail(email) ? 'личная' : 'корпоративная',
@@ -109,7 +113,7 @@ export function exportAll(db, { dir = 'out', keepPersonal = true, generic, depar
 
     for (const best of targets) {
       if (!best && perPerson) continue;
-      const f = best ? parseFio(best.full_name) : null;
+      const f = best ? orderedFio(best.full_name) : null;
       const nom = best?.name_nominative || [f?.first, f?.patronymic].filter(Boolean).join(' ');
       const row = {};
       if (wantGeneric) { row['Общая почта'] = g.email ?? ''; row['Почему такая'] = g.reason; }
@@ -118,7 +122,7 @@ export function exportAll(db, { dir = 'out', keepPersonal = true, generic, depar
         'Внимание': g.foreign ? 'домен не связан с компанией — возможно холдинг или дилер' : '',
         'ФИО для письма': best?.full_name ?? '',
         'Имя Отчество (кто)': nom,
-        'Имя Отчество (кому)': best?.name_dative ?? '',
+        'Имя Отчество (кому)': best?.name_dative || dativeFio(nom),
         'Должность': best?.title ?? '',
         ...companyFields(c, d),
         'Все почты': emails.join(', '),

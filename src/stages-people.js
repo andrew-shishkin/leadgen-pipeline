@@ -9,7 +9,8 @@ import { htmlToText, extractEmails, cutPeopleFragments } from './extract.js';
 import { askJson, modelName, modelFor } from './llm.js';
 import { search, buildQueries, searchProviderName, builtinQueries, builtinAvailable } from './search.js';
 import { findEmail, validateEmail, activeProviders, guessEmail } from './enrich.js';
-import { matchEmailToPerson, parseFio, looksPersonal } from './emails.js';
+import { matchEmailToPerson, parseFio, looksPersonal, orderedFio } from './emails.js';
+import { superviseDecline } from './names.js';
 import { loadPrompt } from './stages.js';
 
 const fill = (t, v) => t.replace(/\{\{(\w+)\}\}/g, (_, k) => v[k] ?? '');
@@ -615,6 +616,19 @@ const DECLINE_SCHEMA = {
   required: ['names'], additionalProperties: false,
 };
 
+/**
+ * Обращение для письма: «Имя Отчество» в именительном и дательном падеже.
+ *
+ * Эти поля уходят в текст письма переменными, поэтому именительный падеж
+ * считается кодом и нейросети не доверяется вовсе. Раньше ей отдавали
+ * строку ФИО и обещали формат «Фамилия Имя Отчество» — на «Ирина Шамина»
+ * она брала фамилию за имя, и в письме получалось обращение «Шамина»,
+ * а дательный оставался пустым.
+ *
+ * Нейросеть отвечает только за дательный падеж: там встречаются беглые
+ * гласные и нерусские имена, где правила ошибаются. Её ответ проверяет
+ * superviseDecline, и что не прошло проверку — склоняется по правилам.
+ */
 export async function declineNames(db, client, { model } = {}) {
   const rows = db.prepare(`
     SELECT DISTINCT p.full_name FROM people p JOIN companies c ON c.id=p.company_id
@@ -622,28 +636,55 @@ export async function declineNames(db, client, { model } = {}) {
   if (!rows.length) return { done: 0 };
 
   const upd = db.prepare(`UPDATE people SET name_nominative=?, name_dative=? WHERE full_name=?`);
-  const system =
-    'Тебе дают ФИО российских сотрудников в формате «Фамилия Имя Отчество».\n' +
-    'Для каждого верни ТОЛЬКО имя и отчество (без фамилии) в двух падежах:\n' +
-    '  nominative — именительный: «Пётр Сергеевич»\n' +
-    '  dative — дательный: «Петру Сергеевичу»\n' +
-    'Это обращение в письме, поэтому важна точность. Имена нерусского ' +
-    'происхождения (Ким, Мамедов, Гулиев оглы) склоняй по правилам русского ' +
-    'языка для таких имён. Если отчества нет — верни только имя в нужном падеже. ' +
-    'Если разобрать ФИО невозможно — верни пустые строки.';
+  const stat = { done: 0, fixed: 0, noName: 0, problems: [] };
 
-  const stat = { done: 0 };
+  // именительный падеж — всегда наш, из разбора ФИО
+  const want = new Map();
+  for (const { full_name } of rows) {
+    const p = orderedFio(full_name);
+    const nom = [p?.first, p?.patronymic].filter(Boolean).join(' ').trim();
+    if (nom) want.set(full_name, { nom, first: p.first, patronymic: p.patronymic });
+    else { upd.run('', '', full_name); stat.noName++; }
+  }
+  if (!want.size) return stat;
+
+  const system =
+    'Тебе дают обращения к российским сотрудникам в именительном падеже: ' +
+    'имя или имя с отчеством, без фамилии.\n' +
+    'Для каждого верни то же самое в ДАТЕЛЬНОМ падеже — это обращение ' +
+    'в письме, «письмо кому».\n' +
+    '  «Пётр Сергеевич» → «Петру Сергеевичу»\n' +
+    '  «Ирина» → «Ирине»\n' +
+    '  «Ксения» → «Ксении»\n' +
+    'Поле nominative возвращай ровно тем, что дали, ничего в нём не меняя. ' +
+    'Имена нерусского происхождения склоняй по правилам русского языка ' +
+    'для таких имён; если имя не склоняется — верни его без изменений.';
+
   const CHUNK = 25;
-  for (let i = 0; i < rows.length; i += CHUNK) {
-    const chunk = rows.slice(i, i + CHUNK).map((r) => r.full_name);
+  const list = [...want.entries()];
+  for (let i = 0; i < list.length; i += CHUNK) {
+    const chunk = list.slice(i, i + CHUNK);
+    const byNom = new Map(chunk.map(([full, w]) => [w.nom.toLowerCase(), full]));
     const r = await askJson(client, db, {
       stage: 'decline', model: model ?? cheap(), system, schema: DECLINE_SCHEMA, maxTokens: 2500,
-      user: chunk.map((x, k) => `${k + 1}. ${x}`).join('\n'),
+      user: chunk.map(([, w], k) => `${k + 1}. ${w.nom}`).join('\n'),
     });
-    if (!r.ok) continue;
-    for (const n of r.data.names ?? []) {
-      if (!n.full_name) continue;
-      upd.run(n.nominative ?? '', n.dative ?? '', n.full_name);
+
+    const got = new Map();
+    if (r.ok) for (const n of r.data.names ?? []) {
+      const full = byNom.get(String(n.full_name ?? n.nominative ?? '').trim().toLowerCase());
+      if (full) got.set(full, n);
+    }
+
+    // проверяем каждую строку, даже если нейросеть по ней вообще не ответила
+    for (const [full, w] of chunk) {
+      const n = got.get(full) ?? {};
+      const v = superviseDecline({
+        expectedFirst: w.first, expectedPatronymic: w.patronymic,
+        nominative: n.nominative ?? '', dative: n.dative ?? '',
+      });
+      if (!v.ok) { stat.fixed++; if (stat.problems.length < 5) stat.problems.push(`${full}: ${v.problems.join(', ')}`); }
+      upd.run(v.nominative, v.dative, full);
       stat.done++;
     }
   }

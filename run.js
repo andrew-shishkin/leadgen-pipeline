@@ -396,6 +396,13 @@ switch (cmd) {
     console.log('\nСклонение имён для писем...');
     const d = await declineNames(db, client, {});
     console.log(`  обработано имён: ${d.done ?? 0}`);
+    // Эти поля уходят в письмо переменными, поэтому показываем, сколько
+    // раз пришлось поправить нейросеть: молча это делать нельзя.
+    if (d.fixed) {
+      console.log(`  поправлено проверкой: ${d.fixed} — склонены по правилам`);
+      for (const p of d.problems ?? []) console.log(`     ${p}`);
+    }
+    if (d.noName) console.log(`  без имени в ФИО: ${d.noName} — обращение в письме будет пустым`);
     finalReport(db, { title: 'ИТОГИ ПОИСКА ПОЧТ' });
     break;
   }

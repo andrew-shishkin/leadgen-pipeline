@@ -1,6 +1,8 @@
 // Работа с почтами. Всё детерминированно — нейросеть подключается только там,
 // где код честно не справился (см. stages: подбор именной почты).
 
+import { isFirstName } from './names.js';
+
 import { FREE_MAIL_DOMAINS } from './extract.js';
 
 /** Общие почты в порядке предпочтения. Первая найденная и выигрывает. */
@@ -255,18 +257,45 @@ const SURNAME_RE = new RegExp(
  * убывания вероятности. Первый основной, остальные пробуются, только если
  * сервис ответил «не найдено».
  */
-export function personVariants(fio, { max = Number(process.env.ENRICH_NAME_VARIANTS ?? 4) } = {}) {
+/**
+ * ФИО с разобранным порядком слов.
+ *
+ * parseFio считает первое слово фамилией — так записаны российские выгрузки.
+ * Но «Ирина Шамина» и «Дарья Снедкова» записаны наоборот, и по одной строке
+ * это не отличить. Смотрим на окончание: «Шамина» похожа на фамилию,
+ * «Ирина» — нет, значит порядок «Имя Фамилия».
+ *
+ * Одно место на весь проект: тем же порядком пользуются и сервисы поиска
+ * почт, и склонение имён для писем. Пока эта логика жила только внутри
+ * personVariants, обращение в письме получалось по фамилии — «Шамина»
+ * вместо «Ирина», и в дательном падеже пустота.
+ */
+export function orderedFio(fio) {
   const p = parseFio(fio);
-  if (!p?.last) return [];
+  if (!p?.last) return null;
+  let { first, last } = p;
 
-  // Без отчества порядок слов по строке не определить. Смотрим на окончание:
-  // «Снедкова» — фамилия, значит «Дарья Снедкова» это Имя + Фамилия.
-  let first = p.first, last = p.last;
-  if (!p.patronymic && first && last) {
-    // parseFio отдал первое слово как фамилию. Если на фамилию похоже
-    // ВТОРОЕ слово, а первое — нет, значит порядок был «Имя Фамилия».
-    if (SURNAME_RE.test(first) && !SURNAME_RE.test(last)) [first, last] = [last, first];
+  // Одно слово: если это известное имя — значит имя, а не фамилия.
+  if (!first) return isFirstName(last)
+    ? { first: last, last: null, patronymic: p.patronymic, full: p.full }
+    : { first: null, last, patronymic: p.patronymic, full: p.full };
+
+  if (!p.patronymic) {
+    // 1. Словарь имён — самый надёжный признак. Окончаний не хватает:
+    //    «Ирина» оканчивается на -ина ровно как фамилия «Шамина»,
+    //    а «Цыкун» не похож на фамилию ни по одному правилу.
+    const a = isFirstName(first), b = isFirstName(last);
+    if (b && !a) [first, last] = [last, first];
+    // 2. Имени в словаре нет — пробуем по окончанию фамилии.
+    else if (!a && !b && SURNAME_RE.test(first) && !SURNAME_RE.test(last)) [first, last] = [last, first];
   }
+  return { first: first ?? null, last, patronymic: p.patronymic, full: p.full };
+}
+
+export function personVariants(fio, { max = Number(process.env.ENRICH_NAME_VARIANTS ?? 4) } = {}) {
+  const p = orderedFio(fio);
+  if (!p?.last) return [];
+  const { first, last } = p;
 
   const out = [], seen = new Set();
   const push = (f, l) => {
