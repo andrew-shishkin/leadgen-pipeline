@@ -66,6 +66,7 @@ async function ask(title, options, note) {
 // Спросить пользователя, как запускать: быстро или вдвое дешевле.
 // Ничего платного не стартует без явного ответа.
 async function chooseMode(n, perRow) {
+  if (getProvider().noBatch) return 'now';   // у подписки (claude-cli, codex-cli) пакетного API нет
   if (has('batch')) return 'batch';
   if (has('now')) return 'now';
   const est = perRow ? perRow * n : null;

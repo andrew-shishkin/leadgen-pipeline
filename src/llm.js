@@ -1,16 +1,18 @@
 // Диспетчер провайдеров. Вызывающий код не знает, Anthropic это или OpenAI.
-// Провайдер выбирается в .env: LLM_PROVIDER=anthropic|openai
+// Провайдер выбирается в .env: LLM_PROVIDER=anthropic|openai|claude-cli|codex-cli
 
 import { logUsage, j, unj } from './db.js';
 import * as anthropic from './providers/anthropic.js';
 import * as openai from './providers/openai.js';
+import * as claudeCli from './providers/claude-cli.js';
+import * as codexCli from './providers/codex-cli.js';
 
-const PROVIDERS = { anthropic, openai };
+const PROVIDERS = { anthropic, openai, 'claude-cli': claudeCli, 'codex-cli': codexCli };
 
 export function getProvider() {
   const key = (process.env.LLM_PROVIDER || 'anthropic').toLowerCase();
   const p = PROVIDERS[key];
-  if (!p) throw new Error(`Неизвестный LLM_PROVIDER="${key}". Допустимо: anthropic, openai`);
+  if (!p) throw new Error(`Неизвестный LLM_PROVIDER="${key}". Допустимо: anthropic, openai, claude-cli, codex-cli`);
   return p;
 }
 
@@ -44,6 +46,15 @@ export const priceOf = (model, u) => getProvider().price(model, u);
 
 export function makeClient() {
   const p = getProvider();
+  // claude-cli / codex-cli работают по подписке: ключа нет, нужен установленный CLI
+  if (!p.keyEnv) {
+    if (!p.validateKey()) {
+      throw new Error(
+        `\n  Не найден CLI для провайдера ${p.name}.\n` +
+        `  Установите его и войдите через ${p.consoleUrl}, либо выберите другой LLM_PROVIDER в .env.\n`);
+    }
+    return p.makeClient();
+  }
   const apiKey = process.env[p.keyEnv];
   if (!p.validateKey(apiKey)) {
     throw new Error(

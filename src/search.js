@@ -304,7 +304,7 @@ async function builtinSearch(client, db, query, { limit = 10, maxUses = 1 } = {}
   if (p.name !== 'anthropic') {
     throw new Error(
       'SEARCH_PROVIDER=builtin работает только с LLM_PROVIDER=anthropic.\n' +
-      '  При работе через OpenAI укажите SEARCH_PROVIDER=yandex (или none).');
+      '  С другими провайдерами укажите SEARCH_PROVIDER=yandex (или none).');
   }
   // Содержимое найденных страниц приходит зашифрованным: читать его может
   // только модель. Поэтому просим её саму выписать факты из выдачи —

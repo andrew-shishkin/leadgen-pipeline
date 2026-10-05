@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { searchProviderName, yandexKeysPresent, searchProviderNote } from './search.js';
 import { loadTitles } from './stages-people.js';
+import { installed } from './providers/cli.js';
 
 const sha = (s) => crypto.createHash('sha256').update(s.replace(/\r\n/g, '\n').trim()).digest('hex').slice(0, 16);
 /** 1 формулировка, 2 формулировки, 5 формулировок */
@@ -31,8 +32,10 @@ export function collectStatus() {
     ['wiza', 'WIZA_API_KEY'], ['fullenrich', 'FULLENRICH_API_KEY'],
   ];
   return {
-    llm: { provider, ok: has(provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY'),
-           env: provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY' },
+    llm: provider.endsWith('-cli')
+      ? { provider, ok: installed(provider === 'codex-cli' ? (process.env.CODEX_BIN || 'codex') : (process.env.CLAUDE_BIN || 'claude')), env: null }
+      : { provider, ok: has(provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY'),
+          env: provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY' },
     search: { provider: searchProvider, yandexOk: yandexKeysPresent(), note: searchProviderNote() },
     mail: mailProviders.map(([name, env]) => ({ name, env, ok: has(env) })),
     validate: { ok: has('ZEROBOUNCE_API_KEY') },
@@ -51,7 +54,8 @@ export function printCheck(db) {
   L.push('', '─'.repeat(64), '  ПРОВЕРКА НАСТРОЙКИ', '─'.repeat(64), '');
 
   L.push('  НЕЙРОСЕТЬ — без неё не работает ничего');
-  if (s.llm.ok) { L.push(`    ✅ ${s.llm.provider} — ключ на месте`); done.push(`нейросеть ${s.llm.provider}`); }
+  if (s.llm.ok) { L.push(`    ✅ ${s.llm.provider} — ${s.llm.env ? 'ключ на месте' : 'CLI найден, работает по подписке'}`); done.push(`нейросеть ${s.llm.provider}`); }
+  else if (!s.llm.env) { L.push(`    ❌ ${s.llm.provider}: не найден CLI ${s.llm.provider.replace('-cli', '')}`); todo.push('CLI нейросети'); }
   else { L.push(`    ❌ ${s.llm.provider}: не заполнен ${s.llm.env} в файле .env`); todo.push('ключ нейросети'); }
 
   L.push('', '  ПОИСК ЛПР В ИНТЕРНЕТЕ');
