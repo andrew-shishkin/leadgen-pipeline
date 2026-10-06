@@ -19,6 +19,7 @@ const has = (k) => (process.env[k] ?? '').trim().length > 5;
 const LLM_KEYS = { anthropic: 'ANTHROPIC_API_KEY', openai: 'OPENAI_API_KEY',
                    deepseek: 'DEEPSEEK_API_KEY', openrouter: 'OPENROUTER_API_KEY' };
 const llmKeyEnv = (p) => LLM_KEYS[p] ?? 'ANTHROPIC_API_KEY';
+export const LLM_PROVIDERS = Object.keys(LLM_KEYS);
 
 /** Промпт ещё в исходном виде? Сверяем с отпечатками, снятыми при сборке шаблона. */
 function promptState(file) {
@@ -37,7 +38,8 @@ export function collectStatus() {
     ['wiza', 'WIZA_API_KEY'], ['fullenrich', 'FULLENRICH_API_KEY'],
   ];
   return {
-    llm: { provider, ok: has(llmKeyEnv(provider)), env: llmKeyEnv(provider) },
+    llm: { provider, known: provider in LLM_KEYS,
+           ok: (provider in LLM_KEYS) && has(llmKeyEnv(provider)), env: llmKeyEnv(provider) },
     search: { provider: searchProvider, yandexOk: yandexKeysPresent(), note: searchProviderNote() },
     mail: mailProviders.map(([name, env]) => ({ name, env, ok: has(env) })),
     validate: { ok: has('ZEROBOUNCE_API_KEY') },
@@ -56,7 +58,14 @@ export function printCheck(db) {
   L.push('', '─'.repeat(64), '  ПРОВЕРКА НАСТРОЙКИ', '─'.repeat(64), '');
 
   L.push('  НЕЙРОСЕТЬ — без неё не работает ничего');
-  if (s.llm.ok) { L.push(`    ✅ ${s.llm.provider} — ключ на месте`); done.push(`нейросеть ${s.llm.provider}`); }
+  if (!s.llm.known) {
+    // Опечатка в имени провайдера раньше роняла даже саму проверку —
+    // то есть ровно ту команду, которая должна объяснять, что не так.
+    L.push(`    ❌ в .env указан LLM_PROVIDER=${s.llm.provider} — такого провайдера нет`);
+    L.push(`       допустимые значения: ${LLM_PROVIDERS.join(', ')}`);
+    todo.push('исправить LLM_PROVIDER в .env');
+  }
+  else if (s.llm.ok) { L.push(`    ✅ ${s.llm.provider} — ключ на месте`); done.push(`нейросеть ${s.llm.provider}`); }
   else { L.push(`    ❌ ${s.llm.provider}: не заполнен ${s.llm.env} в файле .env`); todo.push('ключ нейросети'); }
 
   L.push('', '  ПОИСК ЛПР В ИНТЕРНЕТЕ');

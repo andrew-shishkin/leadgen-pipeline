@@ -36,8 +36,24 @@ process.on('exit', () => {
 const [cmd, ...args] = process.argv.slice(2);
 const flag = (n, d) => { const i = args.indexOf('--' + n); return i === -1 ? d : (args[i + 1] ?? true); };
 const has = (n) => args.includes('--' + n);
+// Ошибку показываем человеку, а не стектрейсом: ученик видит путь к файлу
+// и номер строки вместо объяснения, что делать. Стек остаётся при DEBUG=1.
+const die = (e) => {
+  if (process.env.DEBUG) console.error(e);
+  else console.error('\n' + String(e?.message ?? e).replace(/^\s*\n/, '') + '\n');
+  process.exit(1);
+};
+process.on('uncaughtException', die);
+process.on('unhandledRejection', die);
+
 const db = openDb(process.env.DB_PATH || 'out/leadgen.db');
-const MODEL = modelName();
+
+// Провайдер разбираем отложенно. Раньше имя модели вычислялось здесь же,
+// и опечатка в LLM_PROVIDER роняла ВСЕ команды, включая check — то есть
+// ту единственную, которая и должна была объяснить, что в .env не так.
+let MODEL = null, providerError = null;
+try { MODEL = modelName(); } catch (e) { providerError = e; }
+if (providerError && !['check', 'help', undefined].includes(cmd)) die(providerError);
 const bar = (d, t) => process.stdout.write(`\r  ${d}/${t} (${Math.round(100 * d / t)}%)   `);
 const money = (u) => '$' + u.toFixed(u < 1 ? 4 : 2);
 
