@@ -5,8 +5,9 @@ import { logUsage, j, unj } from './db.js';
 import * as anthropic from './providers/anthropic.js';
 import * as openai from './providers/openai.js';
 import * as deepseek from './providers/deepseek.js';
+import * as openrouter from './providers/openrouter.js';
 
-const PROVIDERS = { anthropic, openai, deepseek };
+const PROVIDERS = { anthropic, openai, deepseek, openrouter };
 
 export function getProvider() {
   const key = (process.env.LLM_PROVIDER || 'anthropic').toLowerCase();

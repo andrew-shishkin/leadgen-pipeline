@@ -16,7 +16,8 @@ const has = (k) => (process.env[k] ?? '').trim().length > 5;
 
 /** Переменная с ключом у каждого провайдера своя. Раньше тут была развилка
  *  на два имени, и третий провайдер молча проверялся по ключу Anthropic. */
-const LLM_KEYS = { anthropic: 'ANTHROPIC_API_KEY', openai: 'OPENAI_API_KEY', deepseek: 'DEEPSEEK_API_KEY' };
+const LLM_KEYS = { anthropic: 'ANTHROPIC_API_KEY', openai: 'OPENAI_API_KEY',
+                   deepseek: 'DEEPSEEK_API_KEY', openrouter: 'OPENROUTER_API_KEY' };
 const llmKeyEnv = (p) => LLM_KEYS[p] ?? 'ANTHROPIC_API_KEY';
 
 /** Промпт ещё в исходном виде? Сверяем с отпечатками, снятыми при сборке шаблона. */
