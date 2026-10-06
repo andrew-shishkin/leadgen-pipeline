@@ -9,6 +9,7 @@ const PRICING = {
 
 export const name = 'anthropic';
 export const defaultModel = 'claude-sonnet-5';
+export const supportsBatch = true;
 export const keyEnv = 'ANTHROPIC_API_KEY';
 export const consoleUrl = 'console.anthropic.com';
 

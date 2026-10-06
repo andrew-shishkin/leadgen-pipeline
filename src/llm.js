@@ -4,13 +4,14 @@
 import { logUsage, j, unj } from './db.js';
 import * as anthropic from './providers/anthropic.js';
 import * as openai from './providers/openai.js';
+import * as deepseek from './providers/deepseek.js';
 
-const PROVIDERS = { anthropic, openai };
+const PROVIDERS = { anthropic, openai, deepseek };
 
 export function getProvider() {
   const key = (process.env.LLM_PROVIDER || 'anthropic').toLowerCase();
   const p = PROVIDERS[key];
-  if (!p) throw new Error(`Неизвестный LLM_PROVIDER="${key}". Допустимо: anthropic, openai`);
+  if (!p) throw new Error(`Неизвестный LLM_PROVIDER="${key}". Допустимо: ${Object.keys(PROVIDERS).join(', ')}`);
   return p;
 }
 

@@ -14,6 +14,11 @@ const plural = (n, one, few, many) => {
 };
 const has = (k) => (process.env[k] ?? '').trim().length > 5;
 
+/** Переменная с ключом у каждого провайдера своя. Раньше тут была развилка
+ *  на два имени, и третий провайдер молча проверялся по ключу Anthropic. */
+const LLM_KEYS = { anthropic: 'ANTHROPIC_API_KEY', openai: 'OPENAI_API_KEY', deepseek: 'DEEPSEEK_API_KEY' };
+const llmKeyEnv = (p) => LLM_KEYS[p] ?? 'ANTHROPIC_API_KEY';
+
 /** Промпт ещё в исходном виде? Сверяем с отпечатками, снятыми при сборке шаблона. */
 function promptState(file) {
   if (!fs.existsSync(file)) return { file, missing: true };
@@ -31,8 +36,7 @@ export function collectStatus() {
     ['wiza', 'WIZA_API_KEY'], ['fullenrich', 'FULLENRICH_API_KEY'],
   ];
   return {
-    llm: { provider, ok: has(provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY'),
-           env: provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY' },
+    llm: { provider, ok: has(llmKeyEnv(provider)), env: llmKeyEnv(provider) },
     search: { provider: searchProvider, yandexOk: yandexKeysPresent(), note: searchProviderNote() },
     mail: mailProviders.map(([name, env]) => ({ name, env, ok: has(env) })),
     validate: { ok: has('ZEROBOUNCE_API_KEY') },

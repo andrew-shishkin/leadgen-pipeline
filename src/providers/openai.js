@@ -9,6 +9,7 @@ import OpenAI from 'openai';
 
 export const name = 'openai';
 export const defaultModel = process.env.OPENAI_MODEL || 'gpt-5';
+export const supportsBatch = true;
 export const keyEnv = 'OPENAI_API_KEY';
 export const consoleUrl = 'platform.openai.com';
 

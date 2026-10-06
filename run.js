@@ -66,6 +66,12 @@ async function ask(title, options, note) {
 // Спросить пользователя, как запускать: быстро или вдвое дешевле.
 // Ничего платного не стартует без явного ответа.
 async function chooseMode(n, perRow) {
+  // Пакетный режим есть не у всех провайдеров. Раньше вопрос задавался всегда,
+  // и выбор «вдвое дешевле» упирался в сбой посреди платного прогона.
+  if (getProvider().supportsBatch === false) {
+    if (has('batch')) console.log(`\n  У провайдера ${getProvider().name} нет пакетного режима — иду обычным.\n`);
+    return 'now';
+  }
   if (has('batch')) return 'batch';
   if (has('now')) return 'now';
   const est = perRow ? perRow * n : null;
