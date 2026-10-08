@@ -23,6 +23,11 @@ export const yandexKeysPresent = () =>
 /** Ключ Serper (Google через API) заполнен? */
 export const serperKeyPresent = () => (process.env.SERPER_API_KEY ?? '').trim().length > 5;
 
+/** Ключи официального Google Custom Search заполнены? */
+export const googleKeysPresent = () =>
+  (process.env.GOOGLE_API_KEY ?? '').trim().length > 5 &&
+  (process.env.GOOGLE_CX ?? '').trim().length > 3;
+
 /** Ключи XMLRiver (Google или Яндекс через API) заполнены? */
 export const xmlriverKeysPresent = () =>
   (process.env.XMLRIVER_USER ?? '').trim().length > 0 &&
@@ -31,6 +36,63 @@ export const xmlriverKeysPresent = () =>
 /** Отправлять запросы в Яндекс отложенно? Это в 16 раз дешевле обычного
  *  режима, но ответ приходит не сразу. Спрашивается у пользователя. */
 export const yandexDeferred = () => (process.env.YANDEX_DEFERRED ?? 'false') === 'true';
+
+/**
+ * Полный каталог способов искать людей — единственный источник правды
+ * и для меню выбора, и для проверки настройки, и для объяснений агента.
+ *
+ * Показываем ВСЕ варианты, включая те, на которые ключа ещё нет: иначе
+ * пользователь не знает, из чего выбирает, и не может оценить, стоит ли
+ * заводить ещё один ключ. Цена у большинства — за один поисковый запрос,
+ * у встроенного поиска — сразу за компанию: внутри одного вызова модель
+ * делает несколько поисков и платит ещё и за токены.
+ */
+export function searchOptions() {
+  return [
+    {
+      id: 'yandex-deferred', label: 'Яндекс Search API, отложенные запросы',
+      region: 'Россия', speed: 'ответ от минут до нескольких часов',
+      usdPerQuery: YANDEX_RUB_DEFERRED / USD_RUB, ready: yandexKeysPresent(),
+      need: 'YANDEX_API_KEY + YANDEX_FOLDER_ID', where: 'console.yandex.cloud',
+      note: 'самый дешёвый вариант: в 16 раз дешевле обычных запросов',
+    },
+    {
+      id: 'yandex', label: 'Яндекс Search API, обычные запросы',
+      region: 'Россия', speed: 'ответ сразу',
+      usdPerQuery: YANDEX_RUB / USD_RUB, ready: yandexKeysPresent(),
+      need: 'YANDEX_API_KEY + YANDEX_FOLDER_ID', where: 'console.yandex.cloud',
+      note: 'дороже отложенных, зато не надо ждать',
+    },
+    {
+      id: 'serper', label: 'Google через Serper',
+      region: 'весь мир', speed: 'ответ сразу',
+      usdPerQuery: SERPER_USD, ready: serperKeyPresent(),
+      need: 'SERPER_API_KEY', where: 'serper.dev',
+      note: 'обычная гугловая выдача, видит LinkedIn',
+    },
+    {
+      id: 'xmlriver', label: 'Google или Яндекс через XMLRiver',
+      region: 'весь мир', speed: 'ответ сразу',
+      usdPerQuery: XMLRIVER_RUB / USD_RUB, ready: xmlriverKeysPresent(),
+      need: 'XMLRIVER_USER + XMLRIVER_KEY', where: 'xmlriver.com',
+      note: 'российский сервис-посредник, оплата в рублях',
+    },
+    {
+      id: 'google', label: 'Google Custom Search API (официальный)',
+      region: 'весь мир', speed: 'ответ сразу',
+      usdPerQuery: GOOGLE_USD, ready: googleKeysPresent(),
+      need: 'GOOGLE_API_KEY + GOOGLE_CX', where: 'developers.google.com/custom-search',
+      note: 'ЗАКРЫТ для новых клиентов, работает до 01.01.2027; 100 запросов в день бесплатно',
+    },
+    {
+      id: 'builtin', label: 'Встроенный поиск внутри API Anthropic',
+      region: 'весь мир', speed: 'ответ сразу',
+      usdPerCompany: BUILTIN_USD_PER_COMPANY, ready: builtinAvailable(),
+      need: 'LLM_PROVIDER=anthropic', where: 'отдельного ключа не нужно',
+      note: 'САМЫЙ ДОРОГОЙ: примерно в 50 раз дороже отложенных запросов Яндекса',
+    },
+  ];
+}
 
 /** Какой поиск использовать.
  *
@@ -47,6 +109,7 @@ export function searchProviderName() {
   if (yandexKeysPresent()) return 'yandex';
   if (serperKeyPresent()) return 'serper';
   if (xmlriverKeysPresent()) return 'xmlriver';
+  if (googleKeysPresent()) return 'google';
   return 'none';
 }
 
@@ -254,6 +317,10 @@ export const YANDEX_RUB = Number(process.env.YANDEX_PRICE_RUB ?? 0.488);
 export const YANDEX_RUB_DEFERRED = Number(process.env.YANDEX_PRICE_RUB_DEFERRED ?? 0.0305);
 const SERPER_USD = Number(process.env.SERPER_PRICE_USD ?? 0.001);
 const XMLRIVER_RUB = Number(process.env.XMLRIVER_PRICE_RUB ?? 0.5);
+const GOOGLE_USD = Number(process.env.GOOGLE_PRICE_USD ?? 0.005);
+/** Встроенный поиск считается не за запрос, а за компанию: внутри одного
+ *  вызова модель делает несколько поисков и платит ещё и за токены. */
+const BUILTIN_USD_PER_COMPANY = Number(process.env.BUILTIN_PRICE_USD ?? 0.18);
 
 /** Цена одного запроса в долларах по каждому движку — для оценок до прогона. */
 export function queryPriceUsd(engine) {
@@ -409,6 +476,29 @@ async function serperSearch(db, query, { limit = 10 } = {}) {
   })).filter((x) => x.url);
 }
 
+/** Официальный Google Custom Search JSON API.
+ *
+ *  Внимание: с 2026 года закрыт для новых клиентов и работает до 01.01.2027.
+ *  Оставлен для тех, у кого доступ уже есть; остальным — Serper или XMLRiver. */
+async function googleSearch(db, query, { limit = 10 } = {}) {
+  const key = (process.env.GOOGLE_API_KEY ?? '').trim();
+  const cx = (process.env.GOOGLE_CX ?? '').trim();
+  if (!key || !cx) throw new Error('Для SEARCH_PROVIDER=google нужны GOOGLE_API_KEY и GOOGLE_CX');
+  const d = await withRetry(async () => {
+    const u = `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(key)}`
+            + `&cx=${encodeURIComponent(cx)}&q=${encodeURIComponent(query)}&num=${Math.min(limit, 10)}`;
+    const r = await fetch(u);
+    const j = await r.json();
+    if (!r.ok) { const e = new Error(`Google ${r.status}: ${j?.error?.message ?? ''}`); e.status = r.status; throw e; }
+    return j;
+  });
+  logUsage(db, { stage: 'search', provider: 'google', units: 1, usd: GOOGLE_USD });
+  return (d.items ?? []).slice(0, limit).map((x) => ({
+    url: x.link ?? '', title: x.title ?? '',
+    snippet: (x.snippet ?? '').slice(0, 600), date: '', engine: 'google',
+  })).filter((x) => x.url);
+}
+
 /** XMLRiver отдаёт выдачу в том же XML, что и Яндекс, — разбор общий. */
 async function xmlriverSearch(db, query, { limit = 10 } = {}) {
   const user = (process.env.XMLRIVER_USER ?? '').trim();
@@ -525,9 +615,10 @@ export async function search(client, db, query, opts = {}) {
   if (provider === 'none') return [];
   if (provider === 'yandex') return (await yandexSearch(db, query, opts)).map((x) => ({ ...x, engine: 'yandex' }));
   if (provider === 'serper') return serperSearch(db, query, opts);
+  if (provider === 'google') return googleSearch(db, query, opts);
   if (provider === 'xmlriver') return xmlriverSearch(db, query, opts);
   if (provider === 'builtin') return (await builtinSearch(client, db, query, opts)).map((x) => ({ ...x, engine: 'builtin' }));
   throw new Error(
     `Неизвестный SEARCH_PROVIDER="${provider}".\n` +
-    '  Допустимо: yandex, serper, xmlriver, builtin, both, none (или auto).');
+    '  Допустимо: yandex, serper, xmlriver, google, builtin, both, none (или auto).');
 }

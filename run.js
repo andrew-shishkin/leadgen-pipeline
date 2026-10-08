@@ -16,7 +16,7 @@ import { enrichPages, retryWithBrowser, peopleFromPages, peopleFromSearch,
          matchTitles, verifyPeople, findEmails, validateEmails, declineNames, loadTitles } from './src/stages-people.js';
 import { browserAvailable, installHint, closeBrowser } from './src/browser.js';
 import { searchProviderName, buildQueries, builtinQueries, yandexKeysPresent, builtinAvailable,
-         serperKeyPresent, xmlriverKeysPresent, queryPriceUsd, YANDEX_RUB, YANDEX_RUB_DEFERRED } from './src/search.js';
+         serperKeyPresent, xmlriverKeysPresent, searchOptions } from './src/search.js';
 import { activeProviders } from './src/enrich.js';
 import { exportAll } from './src/export.js';
 import { printCheck, collectStatus } from './src/check.js';
@@ -260,7 +260,7 @@ switch (cmd) {
       if (share < 15) console.log('  ⚠️  Прошло меньше 15% — проверьте критерии, иначе большая часть списка не дойдёт до поиска.');
       // Цены — измеренные, а не придуманные: рубль за запрос Яндекса взят
       // по факту счёта, стоимость разбора — по таблице usage.
-      const RUB = YANDEX_RUB;
+      const RUB = Number(process.env.YANDEX_PRICE_RUB ?? 0.488);
       const USD_RUB = Number(process.env.USD_RUB ?? 86);
 
       const t = loadTitles();
@@ -295,53 +295,57 @@ switch (cmd) {
       const line = (v) => `${money2(v)} за строку · ${money2(v * pass)} за все ${pass}`;
 
       let mode = getMeta(db, 'search_mode', null) ?? String(flag('search', '') || '');
-      const canGoogle = builtinAvailable();
+      const KNOWN = ['yandex', 'yandex-deferred', 'serper', 'xmlriver', 'google', 'builtin', 'both', 'none'];
 
-      // Встроенный поиск больше НИКОГДА не выбирается сам.
-      //
-      // Раньше он стоял первым пунктом меню, а ask() без терминала молча
-      // берёт первый пункт. Любой запуск из агента, по расписанию или в CI
-      // включал самый дорогой движок конвейера — около 15 ₽ на компанию
-      // против 0.27 ₽ у отложенного Яндекса, и узнать об этом пользователь
-      // мог только из счёта. Теперь он доступен лишь явной строкой
-      // SEARCH_PROVIDER=builtin в .env.
-      const KNOWN = ['yandex', 'serper', 'xmlriver', 'both', 'builtin'];
-      if (!canGoogle && ['builtin', 'both'].includes(mode)) {
-        console.log(`  Режим «${mode}» просит встроенный поиск, а он есть только у Anthropic.`);
-        mode = yandexKeysPresent() ? 'yandex' : (serperKeyPresent() ? 'serper' : 'none');
-        console.log(`  Переключаюсь на «${mode}». Вернуть встроенный: LLM_PROVIDER=anthropic.`);
+      if (!KNOWN.includes(mode)) {
+        // Сначала ПОЛНАЯ картина: все способы, включая те, на которые ключа
+        // ещё нет. Иначе пользователь не знает, из чего выбирает, и не может
+        // прикинуть, стоит ли заводить ещё один ключ ради экономии.
+        const opts = searchOptions();
+        const perCompany = (o) => o.usdPerCompany ?? o.usdPerQuery * qn;
+        const m = (u) => '$' + (u < 1 ? u.toFixed(3) : u.toFixed(2));
+        console.log('\n  КАК ИСКАТЬ ЛЮДЕЙ — все варианты');
+        console.log(`  Цены на ваш список из ${pass} компаний, ${qn} запросов на компанию.`);
+        console.log('  К ним добавляется разбор найденного нейросетью: примерно '
+                  + m(parse) + ' на компанию.\n');
+        console.log('     ' + 'вариант'.padEnd(42) + 'строка'.padStart(9)
+                  + ('за ' + pass).padStart(11) + '   регион      ответ');
+        console.log('     ' + '─'.repeat(88));
+        for (const o of opts) {
+          const u = perCompany(o);
+          console.log(`  ${o.ready ? '✅' : '⚪'} ${o.label.padEnd(42)}`
+                    + m(u).padStart(9) + m(u * pass).padStart(11)
+                    + `   ${(o.region).padEnd(11)} ${o.speed}`);
+          console.log(`        ${o.note}`);
+          if (!o.ready) console.log(`        нужен ${o.need} — ${o.where}`);
+        }
+
+        const ready = opts.filter((o) => o.ready).map((o) => ({
+          value: o.id, label: o.label,
+          hint: `${m(perCompany(o) + parse)} за строку · ${m((perCompany(o) + parse) * pass)} за все ${pass}`,
+        }));
+        // Первым пунктом — самый дешёвый: его возьмёт запуск без терминала,
+        // когда отвечать некому. Раньше первым стоял самый дорогой.
+        ready.sort((a, b) => {
+          const A = opts.find((o) => o.id === a.value), B = opts.find((o) => o.id === b.value);
+          return perCompany(A) - perCompany(B);
+        });
+        if (yandexKeysPresent() && builtinAvailable()) ready.push({ value: 'both',
+          label: 'Яндекс + встроенный поиск — максимум находок',
+          hint: 'самый дорогой вариант: платим и за то, и за другое' });
+        ready.push({ value: 'none', label: 'не искать сейчас — сначала подключу ключ',
+          hint: 'этап поиска будет пропущен, остальной конвейер отработает' });
+
+        mode = await ask('Чем искать?', ready,
+          'Цены ориентировочные: они зависят от того, сколько страниц придётся прочитать.');
         setMeta(db, 'search_mode', mode);
       }
-      if (!KNOWN.includes(mode)) {
-        const opts = [];
-        // Первым пунктом — самый дешёвый рабочий вариант: именно его
-        // возьмёт запуск без терминала, когда отвечать некому.
-        if (yandexKeysPresent()) {
-          const defer = qn * YANDEX_RUB_DEFERRED / USD_RUB;
-          const sync = qn * YANDEX_RUB / USD_RUB;
-          opts.push({ value: 'yandex-deferred', label: 'Яндекс, отложенные запросы — в 16 раз дешевле',
-            hint: line(defer + parse) + '  · ответ не сразу: от минут до нескольких часов' });
-          opts.push({ value: 'yandex', label: 'Яндекс, обычные запросы — результат сразу',
-            hint: line(sync + parse) + '  · дороже, зато не надо ждать' });
-        }
-        if (serperKeyPresent()) opts.push({ value: 'serper', label: 'Google через Serper',
-          hint: line(qn * queryPriceUsd('serper') + parse) + '  · для рынков вне России' });
-        if (xmlriverKeysPresent()) opts.push({ value: 'xmlriver', label: 'Google через XMLRiver',
-          hint: line(qn * queryPriceUsd('xmlriver') + parse) + '  · для рынков вне России' });
-        if (yandexKeysPresent() && canGoogle) opts.push({ value: 'both', label: 'Яндекс + встроенный поиск — максимум находок',
-          hint: line(yandex + google + parse) + '  · самый дорогой вариант' });
 
-        if (!opts.length) {
-          console.log('\n  Поисковых ключей нет — этап поиска ЛПР будет пропущен.');
-          console.log('  Подключите в .env один из вариантов:');
-          console.log('    YANDEX_API_KEY + YANDEX_FOLDER_ID — выдача по России');
-          console.log('    SERPER_API_KEY                    — Google через API, вне России');
-          console.log('    XMLRIVER_USER + XMLRIVER_KEY      — то же другим сервисом');
-          mode = 'none';
-        } else {
-          mode = await ask('Как искать людей?', opts,
-            'Цены посчитаны по вашим фактическим расходам, но зависят от сайтов — считайте их ориентиром.');
-        }
+      // Встроенный поиск живёт внутри API Anthropic, на других провайдерах его нет.
+      if (['builtin', 'both'].includes(mode) && !builtinAvailable()) {
+        console.log(`  Режим «${mode}» просит встроенный поиск, а он есть только у Anthropic.`);
+        mode = yandexKeysPresent() ? 'yandex' : (serperKeyPresent() ? 'serper' : 'none');
+        console.log(`  Переключаюсь на «${mode}».`);
         setMeta(db, 'search_mode', mode);
       }
 
@@ -349,8 +353,9 @@ switch (cmd) {
       if (mode === 'yandex-deferred') { process.env.YANDEX_DEFERRED = 'true'; mode = 'yandex'; }
       process.env.SEARCH_PROVIDER = mode;
       const LABEL = { both: 'Яндекс + встроенный поиск', yandex: 'Яндекс', serper: 'Google (Serper)',
-                      xmlriver: 'Google (XMLRiver)', builtin: 'встроенный поиск', none: 'выключен' };
-      console.log(`  Поиск: ${LABEL[mode] ?? mode}${process.env.YANDEX_DEFERRED === 'true' ? ', отложенные запросы' : ''}`);
+                      xmlriver: 'XMLRiver', google: 'Google Custom Search',
+                      builtin: 'встроенный поиск', none: 'выключен' };
+      console.log(`\n  Поиск: ${LABEL[mode] ?? mode}${process.env.YANDEX_DEFERRED === 'true' ? ', отложенные запросы' : ''}`);
     }
     console.log('\nПоиск ЛПР на страницах компаний...');
     const a = await peopleFromPages(db, client, { model: MODEL, onProgress: bar });
