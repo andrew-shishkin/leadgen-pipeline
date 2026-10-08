@@ -7,7 +7,8 @@ import { fetchPage, mapLimit } from './http.js';
 import { fetchWithBrowser, browserAvailable } from './browser.js';
 import { htmlToText, extractEmails, cutPeopleFragments } from './extract.js';
 import { askJson, modelName, modelFor } from './llm.js';
-import { search, buildQueries, searchProviderName, builtinQueries, builtinAvailable } from './search.js';
+import { search, buildQueries, searchProviderName, builtinQueries, builtinAvailable,
+         yandexDeferred, yandexSubmit, yandexCollect } from './search.js';
 import { findEmail, validateEmail, activeProviders, guessEmail } from './enrich.js';
 import { matchEmailToPerson, parseFio, looksPersonal, orderedFio } from './emails.js';
 import { superviseDecline } from './names.js';
@@ -196,15 +197,173 @@ function pickUrls(hits, { limit, skipDomain }) {
   return out;
 }
 
-export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
-  if (searchProviderName() === 'none') return { skipped: true };
-  // Сказать один раз в начале, а не падать на каждой компании по очереди.
-  if (['both', 'builtin'].includes(searchProviderName()) && !builtinAvailable()) {
-    process.stdout.write(
-      '\n  Встроенный поиск (Google) доступен только на Anthropic, а сейчас выбран OpenAI.\n'
-    + '  Ищем через Яндекс. Чтобы вернуть Google, поставьте LLM_PROVIDER=anthropic в .env.\n');
-    if (searchProviderName() === 'builtin') return { skipped: true, reason: 'builtin недоступен на OpenAI' };
+/**
+ * Разобрать найденное по одной компании: скачать страницы, вырезать строки
+ * с людьми, отдать нейросети, сохранить ЛПР.
+ *
+ * Вынесено отдельно, потому что одинаково нужно обоим режимам — и обычному,
+ * и отложенному, где выдача приходит из базы через часы после отправки.
+ */
+async function processHits(db, client, { c, hits, titleList, system, tpl, model, stat }) {
+  const ins = savePerson(db);
+  const engineOf = new Map();
+  for (const h of hits) {
+    if (h.url) engineOf.set(h.url, h.engine);
+    for (const u of h.urls ?? []) engineOf.set(u.url, h.engine);
   }
+  stat.snippets = (stat.snippets ?? 0) + hits.length;
+  if (!hits.length) return;
+
+  // Сниппет Яндекса — сотня символов, имён в нём обычно нет. Страница
+  // компании на TAdviser: 124 КБ текста и 74 строки вида «должность + ФИО».
+  // Поэтому найденные страницы скачиваем и режем регуляркой — качать
+  // бесплатно, резать бесплатно, нейросеть видит только нужные строки.
+  const urls = pickUrls(hits, { limit: PAGE_LIMIT, skipDomain: c.domain });
+  const pages = (await mapLimit(urls, 4, async (u) => {
+    try {
+      const r = await fetchPage(u, { timeout: 12000 });
+      if (!r.ok || !r.html) return null;
+      const cut = cutPeopleFragments(htmlToText(r.html));
+      return cut ? `ИСТОЧНИК: ${u}\n${cut}` : null;
+    } catch { return null; }
+  })).filter(Boolean);
+  stat.pagesRead = (stat.pagesRead ?? 0) + pages.length;
+
+  const notes = hits.filter((h) => h.engine === 'builtin')
+    .map((h) => h.snippet).filter(Boolean).join('\n\n').slice(0, NOTE_BUDGET);
+  const snippets = hits.filter((h) => h.engine !== 'builtin').map((h, i) =>
+    `${i + 1}. ${h.title}\n   ${h.url}${h.date ? `\n   дата: ${h.date}` : ''}\n   ${h.snippet}`)
+    .join('\n\n').slice(0, SERP_BUDGET);
+
+  const text = [
+    pages.length && `ФРАГМЕНТЫ СО СТРАНИЦ (главное — здесь):\n\n${pages.join('\n\n').slice(0, PAGE_BUDGET)}`,
+    notes && `НАЙДЕНО ПОИСКОМ (выписки по каждому запросу):\n\n${notes}`,
+    snippets && `ЗАГОЛОВКИ ВЫДАЧИ:\n\n${snippets}`,
+  ].filter(Boolean).join('\n\n');
+
+  const r = await askJson(client, db, {
+    stage: 'people-search', model, system, schema: PEOPLE_SCHEMA, companyId: c.id, maxTokens: 3000,
+    user: fill(tpl, { name: c.name, site: c.site, titles: titleList, text }),
+  });
+  if (r.ok) for (const p of r.data.people ?? []) {
+    if (!p.full_name?.trim()) continue;
+    const eng = engineOf.get(p.source_url) ?? hits[0]?.engine ?? 'unknown';
+    ins.run(c.id, p.full_name.trim(), p.title ?? '', 'search', p.source_url || null,
+            p.published_year ? String(p.published_year) : null);
+    db.prepare(`UPDATE people SET engine=? WHERE company_id=? AND full_name=? AND engine IS NULL`)
+      .run(eng, c.id, p.full_name.trim());
+    stat[eng] = (stat[eng] ?? 0) + 1;
+    stat.found = (stat.found ?? 0) + 1;
+  }
+}
+
+/**
+ * Отложенный поиск в Яндексе. Запросы уходят пачкой, ответы забираются
+ * позже — так они стоят 30.5 ₽ за 1000 вместо 488 ₽.
+ *
+ * Три фазы, и каждая умеет продолжиться с места остановки:
+ *   1. отправка — компания помечается submitted, операции ложатся в базу;
+ *   2. опрос — готовые ответы сохраняются;
+ *   3. разбор — компания, у которой все ответы собраны, обрабатывается.
+ *
+ * Прогон можно прервать на любой фазе: отправленные запросы уже оплачены
+ * и никуда не денутся, повторный запуск их не продублирует.
+ */
+async function peopleFromSearchDeferred(db, client, { model, onProgress } = {}) {
+  const { system, user: tpl } = loadPrompt('prompts/people.md');
+  const titles = loadTitles();
+  const titleList = [...titles.targets, ...titles.accept].join(', ');
+  const all = [...titles.targets, ...titles.accept];
+  const stat = { mode: 'deferred', submitted: 0, collected: 0, companies: 0, found: 0, pending: 0 };
+
+  // ── 1. отправка
+  const fresh = db.prepare(`
+    SELECT id, name, site, domain FROM companies
+    WHERE icp_status='pass' AND search_status IS NULL`).all();
+  if (fresh.length) {
+    const insOp = db.prepare(`INSERT OR IGNORE INTO search_ops (id, company_id, query) VALUES (?,?,?)`);
+    const markSent = db.prepare(`UPDATE companies SET search_status='submitted' WHERE id=?`);
+    process.stdout.write(`\n  Отправка отложенных запросов: ${fresh.length} компаний\n`);
+    await mapLimit(fresh, 4, async (c) => {
+      for (const q of buildQueries(c, all)) {
+        try { insOp.run(await yandexSubmit(db, q.q), c.id, q.q); stat.submitted++; }
+        catch (e) { process.stderr.write(`\n  ! отправка: ${e.message.slice(0, 160)}\n`); }
+      }
+      markSent.run(c.id);
+    }, onProgress);
+  }
+
+  // ── 2. опрос. Яндекс отвечает от секунд до нескольких часов, поэтому
+  // ждём ограниченное время и честно говорим, сколько осталось.
+  const waitSec = Number(process.env.YANDEX_WAIT_SECONDS ?? 900);
+  const upd = db.prepare(`UPDATE search_ops SET status=?, raw=?, error=? WHERE id=?`);
+  const deadline = Date.now() + waitSec * 1000;
+  for (;;) {
+    const running = db.prepare(`SELECT id FROM search_ops WHERE status='running'`).all();
+    if (!running.length) break;
+    process.stdout.write(`\r  Ждём ответы Яндекса: осталось ${running.length}   `);
+    let gotSomething = false;
+    await mapLimit(running, 8, async (op) => {
+      const r = await yandexCollect(op.id, { limit: 8 });
+      if (!r.done) return;
+      gotSomething = true;
+      if (r.error) upd.run('failed', null, String(r.error).slice(0, 200), op.id);
+      else { upd.run('done', j(r.hits), null, op.id); stat.collected++; }
+    });
+    if (Date.now() > deadline) break;
+    if (!gotSomething) await new Promise((r) => setTimeout(r, 10000));
+  }
+  process.stdout.write('\n');
+
+  // ── 3. разбор компаний, у которых собраны все ответы
+  const ready = db.prepare(`
+    SELECT c.id, c.name, c.site, c.domain FROM companies c
+    WHERE c.search_status='submitted'
+      AND NOT EXISTS (SELECT 1 FROM search_ops o WHERE o.company_id=c.id AND o.status='running')`).all();
+  const markDone = db.prepare(`UPDATE companies SET search_status='done' WHERE id=?`);
+  if (ready.length) {
+    process.stdout.write(`  Разбор ответов: ${ready.length} компаний\n`);
+    await mapLimit(ready, 3, async (c) => {
+      const rows = db.prepare(`SELECT raw FROM search_ops WHERE company_id=? AND status='done'`).all(c.id);
+      const hits = rows.flatMap((r) => unj(r.raw) ?? []);
+      await processHits(db, client, { c, hits, titleList, system, tpl, model, stat });
+      markDone.run(c.id);
+      stat.companies++;
+    }, onProgress);
+  }
+
+  stat.pending = db.prepare(`SELECT COUNT(*) n FROM search_ops WHERE status='running'`).get().n;
+  if (stat.pending) {
+    const left = db.prepare(`SELECT COUNT(*) n FROM companies WHERE search_status='submitted'`).get().n;
+    process.stdout.write(
+      `\n  Ещё не ответили: ${stat.pending} запросов по ${left} компаниям.\n` +
+      '  Они уже оплачены и никуда не денутся — ноутбук можно закрыть.\n' +
+      '  Заберёте позже той же командой: node run.js people\n');
+  }
+  return stat;
+}
+
+export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
+  const mode = searchProviderName();
+  if (mode === 'none') {
+    process.stdout.write(
+      '\n  Поиск ЛПР в интернете выключен: ни одного поискового ключа не найдено.\n'
+    + '  Подключите один из вариантов в .env и повторите:\n'
+    + '    YANDEX_API_KEY + YANDEX_FOLDER_ID — выдача по России\n'
+    + '    SERPER_API_KEY                    — Google через API, для не-РФ рынков\n'
+    + '    XMLRIVER_USER + XMLRIVER_KEY      — то же самое другим сервисом\n');
+    return { skipped: true };
+  }
+  // Сказать один раз в начале, а не падать на каждой компании по очереди.
+  if (['both', 'builtin'].includes(mode) && !builtinAvailable()) {
+    process.stdout.write(
+      '\n  Встроенный поиск (Google) доступен только на Anthropic, а сейчас выбран другой провайдер.\n'
+    + '  Ищем остальными движками. Вернуть встроенный: LLM_PROVIDER=anthropic в .env.\n');
+    if (mode === 'builtin') return { skipped: true, reason: 'builtin недоступен без Anthropic' };
+  }
+  // отложенный режим — только у Яндекса и только когда он выбран
+  if (mode === 'yandex' && yandexDeferred()) return peopleFromSearchDeferred(db, client, { model, onProgress });
+
   const { system, user: tpl } = loadPrompt('prompts/people.md');
   const titles = loadTitles();
   const titleList = [...titles.targets, ...titles.accept].join(', ');
@@ -213,7 +372,6 @@ export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
     WHERE icp_status='pass' AND search_status IS NULL`).all();
   if (!rows.length) return { done: 0 };
 
-  const ins = savePerson(db);
   const mark = db.prepare(`UPDATE companies SET search_status='done' WHERE id=?`);
   const stat = { companies: 0, snippets: 0, found: 0 };
 
@@ -221,17 +379,13 @@ export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
     const hits = [];
     let failed = 0;
     // в поиск идут и TARGETS, и ALSO_ACCEPT: раз формулировка нам подходит,
-    // странно её не искать. Раньше искались только TARGETS.
-    const mode = searchProviderName();
+    // странно её не искать.
     const engines = (mode === 'both' ? ['yandex', 'builtin'] : [mode])
       .filter((e) => e !== 'builtin' || builtinAvailable());
     // provider передаётся явно на каждый вызов search() — компании обрабатываются
-    // параллельно (см. mapLimit ниже), и переключение через process.env здесь
-    // раньше ломалось: одна компания успевала перетереть движок другой.
+    // параллельно, и переключение через process.env здесь раньше ломалось:
+    // одна компания успевала перетереть движок другой.
     for (const eng of engines) {
-      // встроенный поиск получает один запрос на компанию — список буквальных
-      // поисковых фраз («должность компания»), по одной на каждую нужную
-      // должность; Яндексу нужны отдельные точные запросы
       if (eng === 'builtin') {
         // по одному вызову на должность: и внимание модели не размазывается
         // по восьми поискам сразу, и контекст не оплачивается по кругу
@@ -246,65 +400,14 @@ export async function peopleFromSearch(db, client, { model, onProgress } = {}) {
         for (const r of res) if (Array.isArray(r)) hits.push(...r);
         continue;
       }
-      const qs = buildQueries(c, [...titles.targets, ...titles.accept]);
-      for (const q of qs) {
+      for (const q of buildQueries(c, [...titles.targets, ...titles.accept])) {
         try { hits.push(...await search(client, db, q.q, { limit: 8, provider: eng })); }
         catch (e) { failed++; process.stderr.write(`\n  ! поиск(${eng}): ${e.message.slice(0, 160)}\n`); }
       }
     }
-    // какой движок отдал какой адрес — по этому потом считаем, кто сколько нашёл
-    const engineOf = new Map();
-    for (const h of hits) {
-      if (h.url) engineOf.set(h.url, h.engine);
-      for (const u of h.urls ?? []) engineOf.set(u.url, h.engine);
-    }
     // если поиск сломан — НЕ помечаем компанию обработанной, иначе потеряем её молча
     if (failed && !hits.length) { stat.searchErrors = (stat.searchErrors ?? 0) + 1; return; }
-    stat.snippets += hits.length;
-    if (hits.length) {
-      // Сниппет Яндекса — сотня символов, имён в нём обычно нет. Страница
-      // компании на TAdviser: 124 КБ текста и 74 строки вида «должность + ФИО».
-      // Поэтому найденные страницы скачиваем и режем регуляркой — качать
-      // бесплатно, резать бесплатно, нейросеть видит только нужные строки.
-      const urls = pickUrls(hits, { limit: PAGE_LIMIT, skipDomain: c.domain });
-      const pages = (await mapLimit(urls, 4, async (u) => {
-        try {
-          const r = await fetchPage(u, { timeout: 12000 });
-          if (!r.ok || !r.html) return null;
-          const cut = cutPeopleFragments(htmlToText(r.html));
-          return cut ? `ИСТОЧНИК: ${u}\n${cut}` : null;
-        } catch { return null; }
-      })).filter(Boolean);
-      stat.pagesRead = (stat.pagesRead ?? 0) + pages.length;
-
-      // выписки встроенного поиска и сниппеты обычной выдачи — разные блоки
-      // с разными бюджетами, иначе один вытесняет другой (см. NOTE_BUDGET)
-      const notes = hits.filter((h) => h.engine === 'builtin')
-        .map((h) => h.snippet).filter(Boolean).join('\n\n').slice(0, NOTE_BUDGET);
-      const snippets = hits.filter((h) => h.engine !== 'builtin').map((h, i) =>
-        `${i + 1}. ${h.title}\n   ${h.url}${h.date ? `\n   дата: ${h.date}` : ''}\n   ${h.snippet}`)
-        .join('\n\n').slice(0, SERP_BUDGET);
-
-      const text = [
-        pages.length && `ФРАГМЕНТЫ СО СТРАНИЦ (главное — здесь):\n\n${pages.join('\n\n').slice(0, PAGE_BUDGET)}`,
-        notes && `НАЙДЕНО ПОИСКОМ (выписки по каждому запросу):\n\n${notes}`,
-        snippets && `ЗАГОЛОВКИ ВЫДАЧИ:\n\n${snippets}`,
-      ].filter(Boolean).join('\n\n');
-      const r = await askJson(client, db, {
-        stage: 'people-search', model, system, schema: PEOPLE_SCHEMA, companyId: c.id, maxTokens: 3000,
-        user: fill(tpl, { name: c.name, site: c.site, titles: titleList, text }),
-      });
-      if (r.ok) for (const p of r.data.people ?? []) {
-        if (!p.full_name?.trim()) continue;
-        const eng = engineOf.get(p.source_url) ?? (engines.length === 1 ? engines[0] : 'unknown');
-        ins.run(c.id, p.full_name.trim(), p.title ?? '', 'search', p.source_url || null,
-                p.published_year ? String(p.published_year) : null);
-        db.prepare(`UPDATE people SET engine=? WHERE company_id=? AND full_name=? AND engine IS NULL`)
-          .run(eng, c.id, p.full_name.trim());
-        stat[eng] = (stat[eng] ?? 0) + 1;
-        stat.found++;
-      }
-    }
+    await processHits(db, client, { c, hits, titleList, system, tpl, model, stat });
     mark.run(c.id);
     stat.companies++;
   }, onProgress);

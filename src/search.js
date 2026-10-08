@@ -20,14 +20,34 @@ export const yandexKeysPresent = () =>
   (process.env.YANDEX_API_KEY ?? '').trim().length > 5 &&
   (process.env.YANDEX_FOLDER_ID ?? '').trim().length > 5;
 
+/** Ключ Serper (Google через API) заполнен? */
+export const serperKeyPresent = () => (process.env.SERPER_API_KEY ?? '').trim().length > 5;
+
+/** Ключи XMLRiver (Google или Яндекс через API) заполнены? */
+export const xmlriverKeysPresent = () =>
+  (process.env.XMLRIVER_USER ?? '').trim().length > 0 &&
+  (process.env.XMLRIVER_KEY ?? '').trim().length > 5;
+
+/** Отправлять запросы в Яндекс отложенно? Это в 16 раз дешевле обычного
+ *  режима, но ответ приходит не сразу. Спрашивается у пользователя. */
+export const yandexDeferred = () => (process.env.YANDEX_DEFERRED ?? 'false') === 'true';
+
 /** Какой поиск использовать.
- *  Значение по умолчанию — auto: Яндекс, если его ключи заполнены, иначе
- *  встроенный. Раньше по умолчанию стоял builtin, и оплаченный Яндекс молча
- *  простаивал: ключи в .env есть, а запросы идут мимо них. */
+ *
+ *  auto выбирает из ОПЛАЧИВАЕМЫХ ключом движков и никогда не включает
+ *  встроенный поиск сам. Раньше включал: при пустых ключах Яндекса auto
+ *  уходил в builtin, а запуск не из терминала молча брал первый пункт меню,
+ *  где стоял «Яндекс + Google». Встроенный поиск — самый дорогой в конвейере,
+ *  около 15 ₽ на компанию против 0.27 ₽ у отложенного Яндекса, и узнать
+ *  об этом пользователь мог только из счёта. Теперь он включается
+ *  исключительно явной строкой SEARCH_PROVIDER=builtin. */
 export function searchProviderName() {
   const set = (process.env.SEARCH_PROVIDER ?? '').trim().toLowerCase();
   if (set && set !== 'auto') return set;
-  return yandexKeysPresent() ? 'yandex' : 'builtin';
+  if (yandexKeysPresent()) return 'yandex';
+  if (serperKeyPresent()) return 'serper';
+  if (xmlriverKeysPresent()) return 'xmlriver';
+  return 'none';
 }
 
 /** Сколько отдельных поисковых фраз просить у встроенного поиска на компанию.
@@ -224,6 +244,27 @@ export function buildQueries(company, titles, { maxChars = MAX_QUERY_CHARS } = {
 export const queriesPerCompany = (titles) =>
   buildQueries({ name: 'Компания', domain: 'x.ru' }, titles).length;
 
+// ─────────────────────────── Цены поиска ───────────────────────────
+// Пишем реальную стоимость в таблицу расходов, а не ноль: раньше Яндекс
+// логировался с usd=0, и в отчёте самый массовый этап выглядел бесплатным.
+
+const USD_RUB = Number(process.env.USD_RUB ?? 86);
+/** Обычный запрос — 488 ₽ за 1000. Отложенный — 30.5 ₽ за 1000, в 16 раз дешевле. */
+export const YANDEX_RUB = Number(process.env.YANDEX_PRICE_RUB ?? 0.488);
+export const YANDEX_RUB_DEFERRED = Number(process.env.YANDEX_PRICE_RUB_DEFERRED ?? 0.0305);
+const SERPER_USD = Number(process.env.SERPER_PRICE_USD ?? 0.001);
+const XMLRIVER_RUB = Number(process.env.XMLRIVER_PRICE_RUB ?? 0.5);
+
+/** Цена одного запроса в долларах по каждому движку — для оценок до прогона. */
+export function queryPriceUsd(engine) {
+  if (engine === 'yandex') return (yandexDeferred() ? YANDEX_RUB_DEFERRED : YANDEX_RUB) / USD_RUB;
+  if (engine === 'yandex-sync') return YANDEX_RUB / USD_RUB;
+  if (engine === 'yandex-deferred') return YANDEX_RUB_DEFERRED / USD_RUB;
+  if (engine === 'serper') return SERPER_USD;
+  if (engine === 'xmlriver') return XMLRIVER_RUB / USD_RUB;
+  return 0;
+}
+
 // ─────────────────────────── Yandex Cloud Search API ───────────────────────────
 
 async function yandexSearch(db, query, { limit = 10 } = {}) {
@@ -251,7 +292,7 @@ async function yandexSearch(db, query, { limit = 10 } = {}) {
   const raw = res.rawData ? Buffer.from(res.rawData, 'base64').toString('utf8') : '';
   const out = parseYandexXml(raw, limit);
   // тарифицируется по запросам, а не по токенам — считаем единицы
-  logUsage(db, { stage: 'search', provider: 'yandex', units: 1, usd: 0 });
+  logUsage(db, { stage: 'search', provider: 'yandex', units: 1, usd: YANDEX_RUB / USD_RUB });
   return out;
 }
 
@@ -281,6 +322,111 @@ export function parseYandexXml(raw, limit = 10) {
     if (out.length >= limit) break;
   }
   return out;
+}
+
+// ─────────────────── Отложенные запросы Яндекса ───────────────────
+// Те же запросы, но ответ приходит не сразу: от минут до нескольких часов.
+// Взамен они стоят 30.5 ₽ за 1000 вместо 488 ₽ — в шестнадцать раз дешевле.
+// На базе в 3000 компаний это разница примерно между 13 200 ₽ и 820 ₽.
+//
+// Отправка и разбор разнесены во времени, поэтому идентификаторы операций
+// лежат в таблице search_ops: прогон можно прервать и продолжить завтра,
+// повторно за отправленные запросы платить не придётся.
+
+const YANDEX_ASYNC_URL = 'https://searchapi.api.cloud.yandex.net/v2/web/searchAsync';
+const YANDEX_OP_URL = 'https://operation.api.cloud.yandex.net/operations/';
+
+function yandexAuth() {
+  const key = process.env.YANDEX_API_KEY, folder = process.env.YANDEX_FOLDER_ID;
+  if (!key || !folder) throw new Error('Для Яндекса нужны YANDEX_API_KEY и YANDEX_FOLDER_ID');
+  return { key, folder };
+}
+
+/** Отправить отложенный запрос. Возвращает идентификатор операции. */
+export async function yandexSubmit(db, query) {
+  const { key, folder } = yandexAuth();
+  const op = await withRetry(async () => {
+    const r = await fetch(YANDEX_ASYNC_URL, {
+      method: 'POST',
+      headers: { Authorization: `Api-Key ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: { searchType: 'SEARCH_TYPE_RU', queryText: query },
+        folderId: folder, responseFormat: 'FORMAT_XML', l10n: 'LOCALIZATION_RU',
+      }),
+    });
+    if (!r.ok) { const e = new Error(`Yandex async ${r.status}: ${(await r.text()).slice(0, 200)}`); e.status = r.status; throw e; }
+    return r.json();
+  });
+  // платим в момент отправки, а не получения — результат уже оплачен
+  logUsage(db, { stage: 'search', provider: 'yandex-deferred', units: 1, usd: YANDEX_RUB_DEFERRED / USD_RUB });
+  return op.id;
+}
+
+/** Забрать результат операции. { done, hits, error } */
+export async function yandexCollect(id, { limit = 10 } = {}) {
+  const { key } = yandexAuth();
+  const r = await fetch(YANDEX_OP_URL + id, { headers: { Authorization: `Api-Key ${key}` } });
+  if (!r.ok) return { done: false, error: `HTTP ${r.status}` };
+  const j = await r.json();
+  if (!j.done) return { done: false };
+  if (j.error) return { done: true, error: j.error.message ?? 'ошибка операции' };
+  const raw = j.response?.rawData;
+  if (!raw) return { done: true, error: 'пустой ответ' };
+  const xml = Buffer.from(raw, 'base64').toString('utf8');
+  return { done: true, hits: parseYandexXml(xml, limit).map((x) => ({ ...x, engine: 'yandex' })) };
+}
+
+// ─────────────────── Google через API-ключ ───────────────────
+// Нужен тем, кто ищет не по России: там Google находит заметно больше
+// Яндекса. Два сервиса на выбор — оба отдают обычную гугловую выдачу,
+// в отличие от встроенного поиска стоят копейки и не требуют Anthropic.
+
+async function serperSearch(db, query, { limit = 10 } = {}) {
+  const key = (process.env.SERPER_API_KEY ?? '').trim();
+  if (!key) throw new Error('Для SEARCH_PROVIDER=serper нужен SERPER_API_KEY');
+  const d = await withRetry(async () => {
+    const r = await fetch('https://google.serper.dev/search', {
+      method: 'POST',
+      headers: { 'X-API-KEY': key, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        q: query, num: limit,
+        gl: process.env.SERPER_COUNTRY || 'us',
+        hl: process.env.SERPER_LANG || 'en',
+      }),
+    });
+    if (!r.ok) { const e = new Error(`Serper ${r.status}: ${(await r.text()).slice(0, 200)}`); e.status = r.status; throw e; }
+    return r.json();
+  });
+  logUsage(db, { stage: 'search', provider: 'serper', units: 1, usd: SERPER_USD });
+  // поля читаем мягко: у сервиса они называются по-разному в разных блоках
+  const list = d.organic ?? d.results ?? [];
+  return list.slice(0, limit).map((x) => ({
+    url: x.link ?? x.url ?? '',
+    title: x.title ?? '',
+    snippet: (x.snippet ?? x.description ?? '').slice(0, 600),
+    date: x.date ?? '',
+    engine: 'serper',
+  })).filter((x) => x.url);
+}
+
+/** XMLRiver отдаёт выдачу в том же XML, что и Яндекс, — разбор общий. */
+async function xmlriverSearch(db, query, { limit = 10 } = {}) {
+  const user = (process.env.XMLRIVER_USER ?? '').trim();
+  const key = (process.env.XMLRIVER_KEY ?? '').trim();
+  if (!user || !key) throw new Error('Для SEARCH_PROVIDER=xmlriver нужны XMLRIVER_USER и XMLRIVER_KEY');
+  const url = `https://xmlriver.com/search/xml?user=${encodeURIComponent(user)}`
+            + `&key=${encodeURIComponent(key)}&query=${encodeURIComponent(query)}`
+            + `&groupby=${limit}`;
+  const xml = await withRetry(async () => {
+    const r = await fetch(url);
+    const t = await r.text();
+    if (!r.ok) { const e = new Error(`XMLRiver ${r.status}`); e.status = r.status; throw e; }
+    const err = t.match(/<error code="(\d+)">([^<]*)</);
+    if (err) { const e = new Error(`XMLRiver: ${err[2]}`); e.providerIssue = true; throw e; }
+    return t;
+  });
+  logUsage(db, { stage: 'search', provider: 'xmlriver', units: 1, usd: XMLRIVER_RUB / USD_RUB });
+  return parseYandexXml(xml, limit).map((x) => ({ ...x, engine: 'xmlriver' }));
 }
 
 // ─────────────────────── Встроенный поиск (Anthropic) ───────────────────────
@@ -378,6 +524,10 @@ export async function search(client, db, query, opts = {}) {
   const provider = opts.provider ?? searchProviderName();
   if (provider === 'none') return [];
   if (provider === 'yandex') return (await yandexSearch(db, query, opts)).map((x) => ({ ...x, engine: 'yandex' }));
+  if (provider === 'serper') return serperSearch(db, query, opts);
+  if (provider === 'xmlriver') return xmlriverSearch(db, query, opts);
   if (provider === 'builtin') return (await builtinSearch(client, db, query, opts)).map((x) => ({ ...x, engine: 'builtin' }));
-  throw new Error(`Неизвестный SEARCH_PROVIDER="${provider}". Допустимо: builtin, yandex, none`);
+  throw new Error(
+    `Неизвестный SEARCH_PROVIDER="${provider}".\n` +
+    '  Допустимо: yandex, serper, xmlriver, builtin, both, none (или auto).');
 }

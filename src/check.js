@@ -3,7 +3,8 @@
 
 import fs from 'node:fs';
 import crypto from 'node:crypto';
-import { searchProviderName, yandexKeysPresent, searchProviderNote } from './search.js';
+import { searchProviderName, yandexKeysPresent, searchProviderNote,
+         serperKeyPresent, xmlriverKeysPresent, yandexDeferred } from './search.js';
 import { loadTitles } from './stages-people.js';
 
 const sha = (s) => crypto.createHash('sha256').update(s.replace(/\r\n/g, '\n').trim()).digest('hex').slice(0, 16);
@@ -40,7 +41,9 @@ export function collectStatus() {
   return {
     llm: { provider, known: provider in LLM_KEYS,
            ok: (provider in LLM_KEYS) && has(llmKeyEnv(provider)), env: llmKeyEnv(provider) },
-    search: { provider: searchProvider, yandexOk: yandexKeysPresent(), note: searchProviderNote() },
+    search: { provider: searchProvider, yandexOk: yandexKeysPresent(),
+              serperOk: serperKeyPresent(), xmlriverOk: xmlriverKeysPresent(),
+              deferred: yandexDeferred(), note: searchProviderNote() },
     mail: mailProviders.map(([name, env]) => ({ name, env, ok: has(env) })),
     validate: { ok: has('ZEROBOUNCE_API_KEY') },
     prompts: [promptState('prompts/qualify.md'), promptState('prompts/titles.md')],
@@ -69,18 +72,31 @@ export function printCheck(db) {
   else { L.push(`    ❌ ${s.llm.provider}: не заполнен ${s.llm.env} в файле .env`); todo.push('ключ нейросети'); }
 
   L.push('', '  ПОИСК ЛПР В ИНТЕРНЕТЕ');
-  if (s.search.provider === 'none') { L.push('    ⚪ выключен (SEARCH_PROVIDER=none)'); todo.push('поиск ЛПР выключен'); }
-  else if (s.search.provider === 'yandex') {
-    if (s.search.yandexOk) { L.push('    ✅ Яндекс — ключ и folder id на месте, поиск идёт через него'); done.push('Яндекс-поиск'); }
-    else { L.push('    ❌ выбран yandex, но нет YANDEX_API_KEY / YANDEX_FOLDER_ID'); todo.push('ключи Яндекса'); }
-  } else {
-    L.push('    ✅ встроенный поиск — работает сразу, ключей не нужно');
-    // «не подключён» пишем только когда ключей действительно нет: если они
-    // заполнены, а провайдер переключён вручную — это другая ситуация, о ней ниже
-    if (!s.search.yandexOk) {
-      L.push('    ⚪ Яндекс не подключён — по России находит заметно больше');
-      todo.push('Яндекс-поиск (по желанию)');
-    }
+  const P = s.search.provider;
+  if (P === 'none') {
+    // Раньше тут писалось «встроенный поиск — работает сразу, ключей не нужно»,
+    // то есть самый дорогой движок конвейера подавался как удобный и бесплатный.
+    L.push('    ❌ поискового ключа нет — этап поиска ЛПР будет пропущен');
+    L.push('       YANDEX_API_KEY + YANDEX_FOLDER_ID — выдача по России');
+    L.push('       SERPER_API_KEY                    — Google через API, вне России');
+    L.push('       XMLRIVER_USER + XMLRIVER_KEY      — то же другим сервисом');
+    todo.push('ключ для поиска ЛПР');
+  } else if (P === 'yandex') {
+    if (s.search.yandexOk) {
+      const d = s.search.deferred;
+      L.push(`    ✅ Яндекс — ключи на месте, запросы ${d ? 'отложенные' : 'обычные'}`);
+      L.push(d ? '       отложенные дешевле обычных в 16 раз, ответ приходит не сразу'
+                : '       отложенные запросы дешевле в 16 раз: YANDEX_DEFERRED=true');
+      done.push('Яндекс-поиск');
+    } else { L.push('    ❌ выбран yandex, но нет YANDEX_API_KEY / YANDEX_FOLDER_ID'); todo.push('ключи Яндекса'); }
+  } else if (P === 'serper' || P === 'xmlriver') {
+    const ok = P === 'serper' ? s.search.serperOk : s.search.xmlriverOk;
+    if (ok) { L.push(`    ✅ Google через ${P} — ключ на месте`); done.push(`поиск через ${P}`); }
+    else { L.push(`    ❌ выбран ${P}, но ключи не заполнены`); todo.push(`ключи ${P}`); }
+  } else if (P === 'builtin' || P === 'both') {
+    L.push(`    ⚠️  выбран встроенный поиск (SEARCH_PROVIDER=${P}) — он самый дорогой`);
+    L.push('       около 15 ₽ на компанию против 0.27 ₽ у отложенных запросов Яндекса');
+    if (s.search.yandexOk) L.push('       ключи Яндекса у вас есть: поставьте SEARCH_PROVIDER=yandex');
   }
   if (s.search.note) L.push(`    ⚠️  ${s.search.note}`);
 

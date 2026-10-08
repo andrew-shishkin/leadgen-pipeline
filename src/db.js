@@ -95,6 +95,21 @@ export function openDb(file = 'out/leadgen.db') {
     -- что это за прогон: список компаний или список ЛПР, что выбрал пользователь
     CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 
+    -- Отложенные поисковые запросы Яндекса. Они в 16 раз дешевле обычных,
+    -- но ответ приходит не сразу, поэтому отправку и разбор приходится
+    -- разносить во времени — а значит, хранить между запусками. Ноутбук
+    -- можно закрыть: отправленные запросы никуда не денутся.
+    CREATE TABLE IF NOT EXISTS search_ops (
+      id         TEXT PRIMARY KEY,     -- идентификатор операции у Яндекса
+      company_id INTEGER,
+      query      TEXT,
+      status     TEXT DEFAULT 'running',  -- running | done | failed
+      raw        TEXT,                  -- ответ целиком, когда придёт
+      error      TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS search_ops_company ON search_ops (company_id, status);
+
     CREATE INDEX IF NOT EXISTS ix_comp_fetch  ON companies(fetch_status);
     CREATE INDEX IF NOT EXISTS ix_comp_icp    ON companies(icp_status);
     CREATE INDEX IF NOT EXISTS ix_people_comp ON people(company_id);
